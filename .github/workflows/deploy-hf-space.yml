@@ -1,0 +1,32 @@
+name: Deploy NodeAI to Hugging Face Space
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ai-server/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Hugging Face CLI
+        run: pip install -U huggingface_hub
+
+      - name: Create Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          test -n "$HF_TOKEN"
+          hf repos create "Node1211/Server" --type space --space-sdk gradio || true
+
+      - name: Deploy Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          test -n "$HF_TOKEN"
+          hf upload "Node1211/Server" ai-server/ . --repo-type=space
