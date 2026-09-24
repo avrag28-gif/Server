@@ -1,36 +1,30 @@
-name: VM Test
+name: VM 6 Hours
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
 
 jobs:
-  vm-test:
+  vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
-      - name: Show runner info
+      - name: Show VM info
         run: |
-          echo "=== GitHub Actions Runner ==="
+          echo "=== GitHub Actions Runner VM ==="
           uname -a
-          echo
-          echo "CPU:"
-          nproc
-          echo
+          echo "CPU: $(nproc)"
           echo "Memory:"
           free -h
-          echo
           echo "Disk:"
           df -h /
-          echo
           echo "OS:"
           cat /etc/os-release
-          echo
-          echo "Hostname:"
-          hostname
-      - name: Keep runner active briefly
+      - name: Keep VM running for up to 6 hours
         run: |
-          echo "Runner VM is active."
-          sleep 30
-          echo "Runner test finished."
+          echo "VM is running..."
+          for i in $(seq 1 360); do
+            echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Runner alive - minute $i/360"
+            sleep 60
+          done
