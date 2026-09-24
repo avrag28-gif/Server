@@ -11,3 +11,5 @@ pinned: false
 # NodeAI AI Server
 
 Hugging Face Space deployment for NodeAI.
+
+Deployment pipeline is active.
