@@ -1,4 +1,4 @@
-name: VM 6 Hours
+name: Windows VM 6 Hours
 
 on:
   workflow_dispatch:
@@ -7,24 +7,26 @@ on:
 
 jobs:
   vm:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: Show VM info
+      - name: Show Windows VM info
+        shell: pwsh
         run: |
-          echo "=== GitHub Actions Runner VM ==="
-          uname -a
-          echo "CPU: $(nproc)"
-          echo "Memory:"
-          free -h
-          echo "Disk:"
-          df -h /
-          echo "OS:"
-          cat /etc/os-release
-      - name: Keep VM running for up to 6 hours
+          Write-Host "=== GitHub Actions Windows Runner VM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "CPU:"
+          (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          Write-Host "RAM:"
+          [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          Write-Host "Disk:"
+          Get-PSDrive C | Select-Object Used,Free
+
+      - name: Keep Windows VM running for up to 6 hours
+        shell: pwsh
         run: |
-          echo "VM is running..."
-          for i in $(seq 1 360); do
-            echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Runner alive - minute $i/360"
-            sleep 60
-          done
+          Write-Host "Windows runner VM is running..."
+          for ($i = 1; $i -le 360; $i++) {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')] Runner alive - minute $i/360"
+            Start-Sleep -Seconds 60
+          }
