@@ -23,6 +23,28 @@ jobs:
           Write-Host "Disk:"
           Get-PSDrive C | Select-Object Used,Free
 
+      - name: Optimize Windows for RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          powercfg /setactive SCHEME_MIN
+
+          $services = @("DiagTrack","dmwappushservice","MapsBroker","SysMain")
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
+          Set-Service -Name "WSearch" -StartupType Manual -ErrorAction SilentlyContinue
+
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
+
+          Write-Host "Windows RDP optimization complete."
+
       - name: Configure RDP account
         shell: pwsh
         env:
