@@ -1,0 +1,36 @@
+name: VM Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  vm-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Show runner info
+        run: |
+          echo "=== GitHub Actions Runner ==="
+          uname -a
+          echo
+          echo "CPU:"
+          nproc
+          echo
+          echo "Memory:"
+          free -h
+          echo
+          echo "Disk:"
+          df -h /
+          echo
+          echo "OS:"
+          cat /etc/os-release
+          echo
+          echo "Hostname:"
+          hostname
+      - name: Keep runner active briefly
+        run: |
+          echo "Runner VM is active."
+          sleep 30
+          echo "Runner test finished."
