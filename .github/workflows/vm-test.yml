@@ -1,4 +1,4 @@
-name: Windows VM 6 Hours + Tailscale
+name: Windows VM 6 Hours + Tailscale + RDP
 
 on:
   workflow_dispatch:
@@ -23,12 +23,42 @@ jobs:
           Write-Host "Disk:"
           Get-PSDrive C | Select-Object Used,Free
 
+      - name: Configure RDP account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Missing GitHub Actions secret: RDP_PASSWORD"
+          }
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue
+          if ($existing) {
+            Set-LocalUser -Name "rdpuser" -Password $securePassword
+          } else {
+            New-LocalUser -Name "rdpuser" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
+
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP user: rdpuser"
+          Write-Host "RDP is enabled."
+
       - name: Install and connect Tailscale
         shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing GitHub Actions secret: TS_AUTHKEY"
+          }
 
           $installer = "$env:TEMP\tailscale-setup.exe"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
@@ -47,7 +77,8 @@ jobs:
       - name: Keep Windows VM running for up to 6 hours
         shell: pwsh
         run: |
-          Write-Host "Windows runner VM + Tailscale is running..."
+          Write-Host "Windows runner + Tailscale + RDP is running..."
+          Write-Host "RDP username: rdpuser"
           for ($i = 1; $i -le 360; $i++) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')] Runner alive - minute $i/360"
             Start-Sleep -Seconds 60
