@@ -23,27 +23,74 @@ jobs:
           Write-Host "Disk:"
           Get-PSDrive C | Select-Object Used,Free
 
-      - name: Optimize Windows for RDP
+      - name: Performance cleanup and RDP optimization
         shell: pwsh
         run: |
           $ErrorActionPreference = "SilentlyContinue"
+
+          # High-performance power plan.
           powercfg /setactive SCHEME_MIN
 
-          $services = @("DiagTrack","dmwappushservice","MapsBroker","SysMain")
+          # Disable non-essential background services only.
+          $services = @(
+            "DiagTrack",
+            "dmwappushservice",
+            "MapsBroker",
+            "SysMain",
+            "WSearch",
+            "Fax",
+            "RetailDemo"
+          )
           foreach ($svc in $services) {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
 
-          Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
-          Set-Service -Name "WSearch" -StartupType Manual -ErrorAction SilentlyContinue
+          # Remove optional preinstalled AppX packages that are not needed for
+          # development/RDP. Do not remove Windows shell, RDP, networking,
+          # Tailscale, PowerShell, or developer/runtime components.
+          $patterns = @(
+            "*Xbox*",
+            "*Solitaire*",
+            "*BingNews*",
+            "*BingWeather*",
+            "*ZuneMusic*",
+            "*ZuneVideo*",
+            "*GetHelp*",
+            "*Getstarted*",
+            "*Microsoft.People*",
+            "*Clipchamp*"
+          )
+          foreach ($pattern in $patterns) {
+            Get-AppxPackage -AllUsers $pattern | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+          }
 
-          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force | Out-Null
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
+          # Stop optional user-session processes when present.
+          $processes = @(
+            "OneDrive",
+            "Teams",
+            "ms-teams",
+            "Widgets",
+            "GameBar",
+            "GameBarFTServer"
+          )
+          foreach ($proc in $processes) {
+            Get-Process -Name $proc -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
 
-          Write-Host "Windows RDP optimization complete."
+          # Disable visual effects that waste bandwidth/desktop rendering work.
+          New-Item -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableCursorSetting -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable transparency/animations for the current user.
+          New-Item -Path "HKCU:SoftwareMicrosoftWindowsCurrentVersionThemesPersonalize" -Force | Out-Null
+          Set-ItemProperty -Path "HKCU:SoftwareMicrosoftWindowsCurrentVersionThemesPersonalize" -Name EnableTransparency -Value 0 -ErrorAction SilentlyContinue
+
+          Write-Host "Performance cleanup and RDP optimization complete."
 
       - name: Configure RDP account
         shell: pwsh
@@ -66,7 +113,7 @@ jobs:
 
           Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
 
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:SYSTEMCurrentControlSetControlTerminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
           Write-Host "RDP user: rdpuser"
@@ -82,24 +129,24 @@ jobs:
             throw "Missing GitHub Actions secret: TS_AUTHKEY"
           }
 
-          $installer = "$env:TEMP\tailscale-setup.exe"
+          $installer = "$env:TEMP	ailscale-setup.exe"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --auth-key="$env:TS_AUTHKEY" --hostname="github-windows-${{ github.run_id }}"
+          & "$env:ProgramFilesTailscale	ailscale.exe" up --auth-key="$env:TS_AUTHKEY" --hostname="github-windows-${{ github.run_id }}"
 
           Start-Sleep -Seconds 5
 
           Write-Host "=== Tailscale IP ==="
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          & "$env:ProgramFilesTailscale	ailscale.exe" ip -4
 
           Write-Host "=== Tailscale Status ==="
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+          & "$env:ProgramFilesTailscale	ailscale.exe" status
 
       - name: Keep Windows VM running for up to 6 hours
         shell: pwsh
         run: |
-          Write-Host "Windows runner + Tailscale + RDP is running..."
+          Write-Host "Optimized Windows runner + Tailscale + RDP is running..."
           Write-Host "RDP username: rdpuser"
           for ($i = 1; $i -le 360; $i++) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')] Runner alive - minute $i/360"
