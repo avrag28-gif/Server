@@ -104,6 +104,16 @@ jobs:
           New-Item -Path $visualEffects -Force | Out-Null
           New-ItemProperty -Path $visualEffects -Name VisualFXSetting -PropertyType DWord -Value 2 -Force | Out-Null
 
+          # Additional RDP tuning for interactive 3D applications.
+          $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-ItemProperty -Path $rdpPolicy -Name "fDisableCdm" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name "fDisableCcm" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name "fDisableWallPaper" -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Prefer WDDM graphics for Remote Desktop sessions where available.
+          $graphics = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-ItemProperty -Path $graphics -Name "UseWddmGraphicsDisplayDriver" -PropertyType DWord -Value 1 -Force | Out-Null
+
           Write-Host "Performance cleanup and RDP optimization complete."
 
       - name: Configure RDP account
