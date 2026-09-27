@@ -7,7 +7,7 @@ on:
 
 jobs:
   vm:
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 360
 
     steps:
@@ -20,6 +20,10 @@ jobs:
           (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
           Write-Host "RAM (GB):"
           [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          Write-Host "GPU:"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion, VideoModeDescription |
+            Format-List
           Write-Host "Disk:"
           Get-PSDrive C | Select-Object Used,Free
 
@@ -28,10 +32,14 @@ jobs:
         run: |
           $ErrorActionPreference = "SilentlyContinue"
 
-          # High-performance power plan.
+          # Keep the VM at maximum AC performance and prevent idle sleep.
           powercfg /setactive SCHEME_MIN
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
 
-          # Disable non-essential background services only.
+          # Disable only services that are unnecessary for this temporary
+          # development/RDP session.
           $services = @(
             "DiagTrack",
             "dmwappushservice",
@@ -46,9 +54,8 @@ jobs:
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
 
-          # Remove optional preinstalled AppX packages that are not needed for
-          # development/RDP. Do not remove Windows shell, RDP, networking,
-          # Tailscale, PowerShell, or developer/runtime components.
+          # Remove optional consumer AppX packages. Do not touch shell,
+          # networking, PowerShell, RDP, or developer/runtime components.
           $patterns = @(
             "*Xbox*",
             "*Solitaire*",
@@ -62,10 +69,11 @@ jobs:
             "*Clipchamp*"
           )
           foreach ($pattern in $patterns) {
-            Get-AppxPackage -AllUsers $pattern | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            Get-AppxPackage -AllUsers $pattern |
+              Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
           }
 
-          # Stop optional user-session processes when present.
+          # Stop optional processes if present.
           $processes = @(
             "OneDrive",
             "Teams",
@@ -79,16 +87,22 @@ jobs:
               Stop-Process -Force -ErrorAction SilentlyContinue
           }
 
-          # Disable visual effects that waste bandwidth/desktop rendering work.
-          New-Item -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Force | Out-Null
-          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path "HKLM:SOFTWAREPoliciesMicrosoftWindows NTTerminal Services" -Name fDisableCursorSetting -PropertyType DWord -Value 1 -Force | Out-Null
+          # Correct RDP policy paths.
+          $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $rdpPolicy -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableCursorSetting -PropertyType DWord -Value 1 -Force | Out-Null
 
-          # Disable transparency/animations for the current user.
-          New-Item -Path "HKCU:SoftwareMicrosoftWindowsCurrentVersionThemesPersonalize" -Force | Out-Null
-          Set-ItemProperty -Path "HKCU:SoftwareMicrosoftWindowsCurrentVersionThemesPersonalize" -Name EnableTransparency -Value 0 -ErrorAction SilentlyContinue
+          # Disable Windows transparency/animation overhead.
+          $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+          New-Item -Path $personalize -Force | Out-Null
+          New-ItemProperty -Path $personalize -Name EnableTransparency -PropertyType DWord -Value 0 -Force | Out-Null
+
+          $visualEffects = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          New-Item -Path $visualEffects -Force | Out-Null
+          New-ItemProperty -Path $visualEffects -Name VisualFXSetting -PropertyType DWord -Value 2 -Force | Out-Null
 
           Write-Host "Performance cleanup and RDP optimization complete."
 
@@ -112,8 +126,19 @@ jobs:
           }
 
           Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
 
-          Set-ItemProperty -Path "HKLM:SYSTEMCurrentControlSetControlTerminal Server" -Name "fDenyTSConnections" -Value 0
+          $terminalServer = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0
+
+          $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path $rdpTcp -Name SecurityLayer -Value 1
+          Set-ItemProperty -Path $rdpTcp -Name MinEncryptionLevel -Value 3
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
           Write-Host "RDP user: rdpuser"
@@ -129,19 +154,43 @@ jobs:
             throw "Missing GitHub Actions secret: TS_AUTHKEY"
           }
 
-          $installer = "$env:TEMP	ailscale-setup.exe"
+          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
 
-          & "$env:ProgramFilesTailscale	ailscale.exe" up --auth-key="$env:TS_AUTHKEY" --hostname="github-windows-${{ github.run_id }}"
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable was not found at $tailscale"
+          }
+
+          & $tailscale up --auth-key="$env:TS_AUTHKEY" --hostname="github-windows-${{ github.run_id }}" --accept-dns=false
 
           Start-Sleep -Seconds 5
 
           Write-Host "=== Tailscale IP ==="
-          & "$env:ProgramFilesTailscale	ailscale.exe" ip -4
+          & $tailscale ip -4
 
           Write-Host "=== Tailscale Status ==="
-          & "$env:ProgramFilesTailscale	ailscale.exe" status
+          & $tailscale status
+
+      - name: Verify RDP and runtime state
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP service ==="
+          Get-Service TermService | Select-Object Status,StartType,Name
+
+          Write-Host "=== RDP listener ==="
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress,LocalPort,State,OwningProcess
+
+          Write-Host "=== CPU/RAM ==="
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $os = Get-CimInstance Win32_OperatingSystem
+          [pscustomobject]@{
+            CPU = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+            RAM_GB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+            FreeRAM_GB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+          } | Format-List
 
       - name: Keep Windows VM running for up to 6 hours
         shell: pwsh
