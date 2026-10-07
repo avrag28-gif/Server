@@ -3,7 +3,8 @@
     restore.ps1 - bring a fresh runner back to exactly where the last one left off.
 
     Order matters:
-        1. files     C:\Users\rdpuser (projects, documents, app settings)
+        1. files     the RDP user's profile (resolved dynamically: projects,
+                     documents, app settings)
                      Program Files / ProgramData delta vs the baseline
         2. registry  HKLM keys, the RDP user's NTUSER.DAT hive, env vars
         3. tasks     custom scheduled tasks
@@ -21,6 +22,11 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'lib.ps1')
+
+# Resolved once, before anything writes into it: on a machine where the profile
+# folder got suffixed this is the difference between restoring the real profile
+# and silently dropping every file into a directory Windows will never use.
+$profileRoot = Resolve-ProfilePath
 
 Step 'Restoring VM state'
 
@@ -80,7 +86,7 @@ $null = Assert-FreeSpace -RequiredGB ($packedGB * 2 + 3) -Why 'restore'
 if (-not $SkipFiles) {
     $work = @($assets | Where-Object { $_.Name -like ('{0}-work.7z*' -f $generation) })
     if ($work.Count -gt 0) {
-        Step 'Restoring user profile  (C:\Users\rdpuser)'
+        Step ('Restoring user profile  ({0})' -f $profileRoot)
         $first = ($work | Sort-Object Name | Select-Object -First 1).FullName
         Expand-StateArchive -Archive $first -Destination 'C:\'
         Ok 'profile files restored'
@@ -134,7 +140,7 @@ if (Test-Path -LiteralPath $regDir) {
 }
 
 # --- 2. the RDP user's personal hive (NTUSER.DAT) ----------------------------
-$ntUser = 'C:\Users\rdpuser\NTUSER.DAT'
+$ntUser = Join-Path $profileRoot 'NTUSER.DAT'
 $userReg   = Join-Path $regDir 'user-hive.reg'
 $userBin   = Join-Path $regDir 'user-hive.bin'
 $userKey   = Join-Path $regDir 'user-hive.key'
@@ -153,7 +159,7 @@ if ($hiveCaptured -and -not (Test-Path -LiteralPath $ntUser)) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ntUser) | Out-Null
         try {
             Copy-Item -LiteralPath $userBin -Destination $ntUser -Force -ErrorAction Stop
-            Ok 'created C:\Users\rdpuser\NTUSER.DAT from the saved hive (profile folder was empty)'
+            Ok ('created {0} from the saved hive (profile folder was empty)' -f $ntUser)
         }
         catch { Warn ("could not materialise NTUSER.DAT: {0}" -f $_.Exception.Message) }
     }

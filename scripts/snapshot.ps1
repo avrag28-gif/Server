@@ -4,7 +4,8 @@
 
     Three packs are produced for each generation:
 
-        <id>-work.7z.*       C:\Users\rdpuser, verbatim
+        <id>-work.7z.*       the RDP user's profile, verbatim
+                             (path resolved dynamically, not assumed)
                              (projects, documents, downloads, app settings,
                               NTUSER.DAT, hidden and system files included)
         <id>-sys.7z.*        Program Files / Program Files (x86) / ProgramData
@@ -64,7 +65,7 @@ Export-RegistryKey -Name 'machine-env.reg'         -Key 'HKLM\SYSTEM\CurrentCont
 #   logged out  -> load the file as HKU\VMState, export, unload
 # user-hive.key records which key the .reg/.bin belong to, so restore.ps1 can
 # load it at exactly the same path.
-$ntUser = 'C:\Users\rdpuser\NTUSER.DAT'
+$ntUser = Join-Path (Resolve-ProfilePath) 'NTUSER.DAT'
 $sid    = Get-LocalUserSid -Name 'rdpuser'
 if (Test-Path -LiteralPath $ntUser) {
     $loadKey = $null
@@ -169,6 +170,18 @@ if ($baseline.Count -eq 0) {
 Log 'indexing user profile...'
 $workFiles = @(Get-StateFiles -Roots $WORK_ROOTS -ExcludeRegex $EXCLUDE_REGEX)
 Log ('  {0:N0} files under {1}' -f $workFiles.Count, ($WORK_ROOTS -join ', '))
+
+# Guard: a profile folder whose name got suffixed is exactly the condition that
+# used to fail silently - a hardcoded path pointed at an empty stub, Test-Path
+# said $true, and the run reported success while saving nothing. Say it out loud.
+foreach ($root in $WORK_ROOTS) {
+    if ($root -and $root -ne 'C:\Users\rdpuser') {
+        Warn ('profile folder resolved to {0} (not C:\Users\rdpuser) - this is the directory being saved' -f $root)
+    }
+    if ($root -and (Test-Path -LiteralPath $root) -and $workFiles.Count -eq 0) {
+        Warn ('{0} exists but holds no files - verify your account actually uses this folder' -f $root)
+    }
+}
 
 # ---------------------------------------------------------------------------
 # System pack - delta against the pristine image

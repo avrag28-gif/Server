@@ -13,7 +13,8 @@
         tag  : vm-state
         base : baseline.7z            <- manifest of the pristine runner image
                manifest.json           <- pointer to the newest generation
-               <id>-work.7z.001..      <- full copy of C:\Users\rdpuser
+               <id>-work.7z.001..      <- full copy of the RDP user's profile
+                                   (path resolved dynamically, not assumed)
                <id>-sys.7z.001..       <- delta of Program Files / ProgramData
                <id>-meta.7z            <- registry, tasks, services, env, package lists
 
@@ -56,9 +57,74 @@ $CFG = [ordered]@{
     EmptyMarker     = '__state_empty__'
 }
 
+function Resolve-ProfilePath {
+    <#
+        The RDP user's profile folder. NEVER assume the literal path.
+
+        Windows silently mints C:\Users\<name>.<COMPUTERNAME> instead of
+        C:\Users\<name> whenever that folder already exists but does not belong
+        to the account logging on - a state restore that pre-creates the folder
+        is the usual cause. A hardcoded path then points at an empty directory:
+        the snapshot packs nothing, `Test-Path` still returns $true so no guard
+        fires, and the run carries on believing it saved everything.
+
+        Resolution order:
+          1. the profile Windows itself records for that SID (authoritative
+             once the user has logged on);
+          2. the most populated C:\Users\<name>[.*] directory - a folder with a
+             hive or files always beats the empty stub that causes the bug;
+          3. the conventional path, when nothing has ever logged on.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$UserName = 'rdpuser',
+        [string]$Default  = 'C:\Users\rdpuser'
+    )
+
+    $leaf     = Split-Path -Leaf $Default
+    $usersRoot = Split-Path -Parent $Default
+
+    # 1. What Windows records as this SID's profile.
+    $sid = $null
+    try   { $sid = (Get-LocalUser -Name $UserName -ErrorAction Stop).SID.Value }
+    catch {
+        try   { $sid = ([System.Security.Principal.NTAccount]$UserName).
+                            Translate([System.Security.Principal.SecurityIdentifier]).Value }
+        catch { $sid = $null }
+    }
+    if ($sid) {
+        try {
+            $recorded = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+                        Where-Object { $_.SID -eq $sid } | Select-Object -First 1
+            if ($recorded -and $recorded.LocalPath -and
+                (Test-Path -LiteralPath $recorded.LocalPath)) {
+                return $recorded.LocalPath
+            }
+        }
+        catch { }
+    }
+
+    # 2. Rank every candidate directory by content: hive wins, then file count.
+    $best = $null
+    $bestScore = -1
+    $candidates = @(Get-ChildItem -LiteralPath $usersRoot -Directory -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -eq $leaf -or $_.Name -like ($leaf + '.*') })
+    foreach ($candidate in $candidates) {
+        $score = @(Get-ChildItem -LiteralPath $candidate.FullName -Force -ErrorAction SilentlyContinue).Count
+        if (Test-Path -LiteralPath (Join-Path $candidate.FullName 'NTUSER.DAT')) { $score += 1000000 }
+        if ($score -gt $bestScore) { $bestScore = $score; $best = $candidate.FullName }
+    }
+    if ($best -and $bestScore -gt 0) { return $best }
+
+    # 3. Nothing has ever logged on - behave exactly as the old hardcoded path.
+    return $Default
+}
+
 # The RDP user's profile. Captured verbatim on every snapshot - this is where
-# your projects, documents, downloads and application settings live.
-$WORK_ROOTS = @('C:\Users\rdpuser')
+# your projects, documents, downloads and application settings live. Resolved
+# dynamically so a machine whose profile folder got suffixed still captures the
+# real directory instead of an empty stub.
+$WORK_ROOTS = @(Resolve-ProfilePath)
 
 # Machine-wide application and configuration roots. The runner image already
 # ships ~120 GB here, so these are captured as a DELTA against the baseline
@@ -682,7 +748,7 @@ function Repair-ProfileAcl {
         7-Zip does not carry NTFS ACLs, so the restored profile would be owned
         by nobody. Re-grant the RDP user full control over their own folder.
     #>
-    $profile = 'C:\Users\rdpuser'
+    $profile = Resolve-ProfilePath
     if (-not (Test-Path -LiteralPath $profile)) { return }
     $null = & icacls $profile /grant 'rdpuser:(OI)(CI)F' /T /C /Q 2>&1
     if ($LASTEXITCODE -eq 0) { Ok 'profile ACLs repaired' }
