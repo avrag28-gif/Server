@@ -1,0 +1,71 @@
+name: VM auto-continue
+
+# ---------------------------------------------------------------------------
+# Safety net for the VM chain.
+#
+# A 6-hour run is killed outright by the job timeout, so its own steps never
+# get to schedule the next one. This workflow fires the moment any run of the
+# VM workflow finishes - success, timeout or early cancellation - and starts
+# the next VM, unless one is already waiting in the concurrency queue.
+#
+# The primary, gapless hand-over happens inside vm-test.yml itself (the
+# keep-alive loop queues the next run a few minutes before the timeout). This
+# workflow only covers the cases where that never got the chance to run.
+#
+# STOP THE CHAIN: set the repository variable VM_CONTINUE to false
+#   Settings -> Secrets and variables -> Variables -> New repository variable
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_run:
+    workflows: ["Windows VM 6 Hours + Tailscale + RDP"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    # A run that broke during setup must NOT be chained, or the same broken
+    # configuration would retry forever. Timeouts report as 'cancelled' and
+    # are exactly the case we need to carry on from.
+    if: >-
+      !contains(fromJSON('["failure","skipped","action_required","startup_failure"]'),
+                github.event.workflow_run.conclusion)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide whether to start the next VM
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_REPO: ${{ github.repository }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          VM_CONTINUE: ${{ vars.VM_CONTINUE }}
+          VM_MAX_CHAIN: ${{ vars.VM_MAX_CHAIN }}
+        run: |
+          Write-Host "previous run concluded: $env:RUN_CONCLUSION"
+          & "$env:GITHUB_WORKSPACE/scripts/continue.ps1"
+          exit 0
+
+      - name: Note
+        if: always()
+        shell: pwsh
+        env:
+          PREV_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          $msg = @(
+            "## Auto-continue",
+            "",
+            ("Previous run concluded **{0}**." -f $env:PREV_CONCLUSION),
+            "",
+            "The next 6-hour VM is queued automatically (unlimited chain).",
+            "",
+            "**To stop for good:** set repository variable ``VM_CONTINUE`` to ``false``",
+            "(*Settings -> Secrets and variables -> Variables*), or let a failure stop it.",
+            ""
+          ) -join "`n"
+          $msg | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

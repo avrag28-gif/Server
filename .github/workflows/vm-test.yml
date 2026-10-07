@@ -1,34 +1,115 @@
 name: Windows VM 6 Hours + Tailscale + RDP
 
+# ---------------------------------------------------------------------------
+# A 6-hour Windows VM you can RDP into over Tailscale, with the entire disk
+# state persisted between runs so the machine picks up exactly where it left
+# off: projects, installed applications, registry, scheduled tasks, services
+# and environment variables.
+#
+#   scripts/baseline.ps1   reference manifest of the pristine runner image
+#                          (must run before restore, once per image)
+#   scripts/restore.ps1    puts the previous VM back onto this one
+#   scripts/snapshot.ps1   packs everything and uploads it to the release
+#   scripts/continue.ps1   decides whether the next VM starts automatically
+#
+# Storage is a GitHub Release (tag: vm-state). Artifacts are useless here -
+# the free plan only includes 500 MB of artifact storage, while releases have
+# no total size or bandwidth limit (2 GiB per asset, 1000 assets per release).
+# ---------------------------------------------------------------------------
+
 on:
   workflow_dispatch:
+    inputs:
+      reason:
+        description: Why this session was started
+        required: false
+        default: manual
+      rebuild_baseline:
+        description: Rebuild the pristine-image baseline (tick after GitHub rolls a new runner image)
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main]
+
+# contents:write  -> create/update the vm-state release
+# actions:write   -> trigger the next run in the chain
+permissions:
+  contents: write
+  actions: write
+
+# One VM at a time. A trigger arriving while a run is live is queued and
+# starts the moment the current one ends - this is what makes the chain
+# seamless instead of leaving a dead gap between runs.
+concurrency:
+  group: windows-vm-session
+  cancel-in-progress: false
 
 jobs:
   vm:
     runs-on: windows-2025
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      STATE_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      VM_CONTINUE: ${{ vars.VM_CONTINUE }}
+      VM_MAX_CHAIN: ${{ vars.VM_MAX_CHAIN }}
+      SNAPSHOT_INTERVAL: ${{ vars.SNAPSHOT_INTERVAL || '20' }}
+      SNAPSHOT_STOP_AFTER: ${{ vars.SNAPSHOT_STOP_AFTER || '330' }}
+      CONTINUE_AT: ${{ vars.CONTINUE_AT || '340' }}
+      LOOP_END: ${{ vars.LOOP_END || '348' }}
+      REBUILD_BASELINE: ${{ inputs.rebuild_baseline }}
 
     steps:
+      # =====================================================================
       - name: Show Windows VM info
-        shell: pwsh
         run: |
           Write-Host "=== GitHub Actions Windows Runner VM ==="
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
-          Write-Host "CPU:"
-          (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
-          Write-Host "RAM (GB):"
-          [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
-          Write-Host "GPU:"
-          Get-CimInstance Win32_VideoController |
-            Select-Object Name, DriverVersion, VideoModeDescription |
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture |
             Format-List
-          Write-Host "Disk:"
-          Get-PSDrive C | Select-Object Used,Free
+          Write-Host "CPU logical cores: $((Get-CimInstance Win32_Processor).NumberOfLogicalProcessors)"
+          Write-Host "RAM (GB): $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2))"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion, VideoModeDescription | Format-List
+          Get-PSDrive C | Select-Object @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},
+                                        @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
+            Format-Table -AutoSize
+          Write-Host "Runner temp: $env:RUNNER_TEMP"
 
+      # =====================================================================
+      # Baseline MUST be taken on a pristine image, before anything is
+      # restored or installed - otherwise your own state gets baked into the
+      # reference and the delta silently stops capturing applications.
+      # =====================================================================
+      - name: Build runner baseline
+        run: |
+          $flags = @()
+          if ($env:REBUILD_BASELINE -eq 'true') { $flags += '-Force' }
+          & pwsh -NoProfile -File "$env:GITHUB_WORKSPACE/scripts/baseline.ps1" @flags
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # =====================================================================
+      - name: Create RDP account
+        run: |
+          . "$env:GITHUB_WORKSPACE/scripts/lib.ps1"
+          Ensure-RdpUser
+
+      # =====================================================================
+      - name: Restore previous VM state
+        run: |
+          & pwsh -NoProfile -File "$env:GITHUB_WORKSPACE/scripts/restore.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "restore reported errors (exit $LASTEXITCODE) - continuing with a partially restored VM"
+          }
+
+      # =====================================================================
       - name: Performance cleanup and RDP optimization
-        shell: pwsh
         run: |
           $ErrorActionPreference = "SilentlyContinue"
 
@@ -38,64 +119,35 @@ jobs:
           powercfg /change standby-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
 
-          # Disable only services that are unnecessary for this temporary
-          # development/RDP session.
-          $services = @(
-            "DiagTrack",
-            "dmwappushservice",
-            "MapsBroker",
-            "SysMain",
-            "WSearch",
-            "Fax",
-            "RetailDemo"
-          )
+          $services = @("DiagTrack","dmwappushservice","MapsBroker","SysMain","WSearch","Fax","RetailDemo")
           foreach ($svc in $services) {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
 
-          # Remove optional consumer AppX packages. Do not touch shell,
-          # networking, PowerShell, RDP, or developer/runtime components.
-          $patterns = @(
-            "*Xbox*",
-            "*Solitaire*",
-            "*BingNews*",
-            "*BingWeather*",
-            "*ZuneMusic*",
-            "*ZuneVideo*",
-            "*GetHelp*",
-            "*Getstarted*",
-            "*Microsoft.People*",
-            "*Clipchamp*"
-          )
+          # Remove optional consumer AppX packages. Never touch shell,
+          # networking, PowerShell, RDP or developer/runtime components.
+          $patterns = @("*Xbox*","*Solitaire*","*BingNews*","*BingWeather*","*ZuneMusic*",
+                        "*ZuneVideo*","*GetHelp*","*Getstarted*","*Microsoft.People*","*Clipchamp*")
           foreach ($pattern in $patterns) {
-            Get-AppxPackage -AllUsers $pattern |
-              Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            Get-AppxPackage -AllUsers $pattern | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
           }
 
-          # Stop optional processes if present.
-          $processes = @(
-            "OneDrive",
-            "Teams",
-            "ms-teams",
-            "Widgets",
-            "GameBar",
-            "GameBarFTServer"
-          )
-          foreach ($proc in $processes) {
-            Get-Process -Name $proc -ErrorAction SilentlyContinue |
-              Stop-Process -Force -ErrorAction SilentlyContinue
+          foreach ($proc in @("OneDrive","Teams","ms-teams","Widgets","GameBar","GameBarFTServer")) {
+            Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           }
 
-          # Correct RDP policy paths.
+          # RDP rendering: drop the effects that cost the most over a remote
+          # session so interactive 3D apps stay responsive.
           $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $rdpPolicy -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableWallpaper -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableFullWindowDrag -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableMenuAnims -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableCursorSetting -PropertyType DWord -Value 1 -Force | Out-Null
+          foreach ($pair in @(
+              @("fDisableWallpaper",1), @("fDisableFullWindowDrag",1), @("fDisableMenuAnims",1),
+              @("fDisableCursorSetting",1), @("fDisableCdm",1), @("fDisableCcm",1),
+              @("UseWddmGraphicsDisplayDriver",1))) {
+            New-ItemProperty -Path $rdpPolicy -Name $pair[0] -PropertyType DWord -Value $pair[1] -Force | Out-Null
+          }
 
-          # Disable Windows transparency/animation overhead.
           $personalize = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
           New-Item -Path $personalize -Force | Out-Null
           New-ItemProperty -Path $personalize -Name EnableTransparency -PropertyType DWord -Value 0 -Force | Out-Null
@@ -104,20 +156,10 @@ jobs:
           New-Item -Path $visualEffects -Force | Out-Null
           New-ItemProperty -Path $visualEffects -Name VisualFXSetting -PropertyType DWord -Value 2 -Force | Out-Null
 
-          # Additional RDP tuning for interactive 3D applications.
-          $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-ItemProperty -Path $rdpPolicy -Name "fDisableCdm" -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name "fDisableCcm" -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name "fDisableWallPaper" -PropertyType DWord -Value 1 -Force | Out-Null
-
-          # Prefer WDDM graphics for Remote Desktop sessions where available.
-          $graphics = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-ItemProperty -Path $graphics -Name "UseWddmGraphicsDisplayDriver" -PropertyType DWord -Value 1 -Force | Out-Null
-
           Write-Host "Performance cleanup and RDP optimization complete."
 
-      - name: Configure RDP account
-        shell: pwsh
+      # =====================================================================
+      - name: Enable Remote Desktop
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -127,35 +169,33 @@ jobs:
           }
 
           $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
           $existing = Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue
-          if ($existing) {
-            Set-LocalUser -Name "rdpuser" -Password $securePassword
-          } else {
-            New-LocalUser -Name "rdpuser" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
-          }
+          if ($existing) { Set-LocalUser -Name "rdpuser" -Password $securePassword }
+          else { New-LocalUser -Name "rdpuser" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires }
 
-          Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
+          $null = Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
+          $null = Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
 
           $terminalServer = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
           Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0
 
+          # SecurityLayer 2 = SSL/TLS rather than the weaker native RDP layer.
+          # The listener is only reachable over the Tailscale interface anyway,
+          # but there is no reason to run the weaker handshake.
           $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
           Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Value 1
-          Set-ItemProperty -Path $rdpTcp -Name SecurityLayer -Value 1
+          Set-ItemProperty -Path $rdpTcp -Name SecurityLayer    -Value 2
           Set-ItemProperty -Path $rdpTcp -Name MinEncryptionLevel -Value 3
 
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
-
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Write-Host "RDP user: rdpuser"
+          Write-Host "RDP user: rdpuser   (password from secret RDP_PASSWORD)"
           Write-Host "RDP is enabled."
 
+      # =====================================================================
       - name: Install and connect Tailscale
-        shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
@@ -164,50 +204,171 @@ jobs:
             throw "Missing GitHub Actions secret: TS_AUTHKEY"
           }
 
-          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
-
+          # Fixed hostname so the machine keeps a recognisable name across
+          # runs. The actual IP is recorded in the state manifest and printed
+          # in the job summary, because Tailscale may suffix the name if an
+          # older node is still registered.
           $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
           if (-not (Test-Path $tailscale)) {
-            throw "Tailscale executable was not found at $tailscale"
+            Write-Host "Tailscale not present - installing"
+            $installer = Join-Path $env:TEMP "tailscale-setup.exe"
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
+            Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
+            if (-not (Test-Path $tailscale)) {
+              throw "Tailscale executable was not found at $tailscale"
+            }
           }
+          else { Write-Host "Tailscale already installed - reusing it" }
 
-          & $tailscale up --auth-key="$env:TS_AUTHKEY" --hostname="github-windows-${{ github.run_id }}" --accept-dns=false
-
+          & $tailscale up --auth-key="$env:TS_AUTHKEY" --hostname="gh-vm" --accept-dns=false --accept-routes=false
           Start-Sleep -Seconds 5
 
           Write-Host "=== Tailscale IP ==="
           & $tailscale ip -4
-
           Write-Host "=== Tailscale Status ==="
           & $tailscale status
 
+      # =====================================================================
       - name: Verify RDP and runtime state
-        shell: pwsh
         run: |
           Write-Host "=== RDP service ==="
-          Get-Service TermService | Select-Object Status,StartType,Name
+          Get-Service TermService | Select-Object Status, StartType, Name | Format-Table -AutoSize
 
           Write-Host "=== RDP listener ==="
-          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress,LocalPort,State,OwningProcess
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($listener) { $listener | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize }
+          else { Write-Warning "No process is listening on 3389 yet" }
 
-          Write-Host "=== CPU/RAM ==="
           $cs = Get-CimInstance Win32_ComputerSystem
           $os = Get-CimInstance Win32_OperatingSystem
           [pscustomobject]@{
-            CPU = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
-            RAM_GB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
-            FreeRAM_GB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+            CPU         = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+            RAM_GB      = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+            FreeRAM_GB  = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+            FreeDisk_GB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
           } | Format-List
 
-      - name: Keep Windows VM running for up to 6 hours
-        shell: pwsh
-        run: |
-          Write-Host "Optimized Windows runner + Tailscale + RDP is running..."
-          Write-Host "RDP username: rdpuser"
-          for ($i = 1; $i -le 360; $i++) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')] Runner alive - minute $i/360"
-            Start-Sleep -Seconds 60
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (Test-Path $tailscale) {
+            $ip = (& $tailscale ip -4 2>$null | Select-Object -First 1)
+            $summary = @(
+              "## Connection",
+              "",
+              "| | |",
+              "| --- | --- |",
+              "| RDP address | ``$ip`` |",
+              "| Username | ``rdpuser`` |",
+              "| Hostname | ``gh-vm`` |",
+              "",
+              "Connect from any machine on your tailnet with any RDP client.",
+              ""
+            ) -join "`n"
+            $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
+
+      # =====================================================================
+      # The heart of the persistence scheme.
+      #
+      # Time is measured against real elapsed minutes, not a loop counter, so
+      # a slow snapshot cannot push the follow-up trigger past the deadline.
+      # Snapshots stop before the end to guarantee the last one has room to
+      # finish, and the next run is queued while this one is still alive - the
+      # concurrency group above makes sure it cannot start early.
+      # =====================================================================
+      - name: Keep Windows VM running for up to 6 hours
+        run: |
+          # Streaming the child's output is intentional: assigning the call to
+          # a variable would swallow every line of snapshot progress.
+          $script:LastSafeExit = 0
+          function Invoke-Safe([string]$Script, [string]$Label, [string[]]$ScriptArgs = @()) {
+            Write-Host ""
+            Write-Host "--- $Label ---"
+            & pwsh -NoProfile -File $Script @ScriptArgs
+            $script:LastSafeExit = $LASTEXITCODE
+            if ($script:LastSafeExit -ne 0) {
+              Write-Warning "$Label exited with code $($script:LastSafeExit) (continuing)"
+            }
+          }
+
+          $scripts   = Join-Path $env:GITHUB_WORKSPACE 'scripts'
+          $interval  = 20; if ($env:SNAPSHOT_INTERVAL)      { $interval  = [int]$env:SNAPSHOT_INTERVAL }
+          $stopSnap  = 330; if ($env:SNAPSHOT_STOP_AFTER)   { $stopSnap  = [int]$env:SNAPSHOT_STOP_AFTER }
+          $chaining  = 340; if ($env:CONTINUE_AT)           { $chaining  = [int]$env:CONTINUE_AT }
+          $loopEnd   = 348; if ($env:LOOP_END)              { $loopEnd   = [int]$env:LOOP_END }
+          if ($interval -lt 5) { $interval = 5 }
+
+          $start        = Get-Date
+          $nextSnapAt   = $interval
+          $nextReport   = 0
+          $didContinue  = $false
+          $failedSnaps  = 0
+
+          Write-Host "VM session started at $($start.ToString('HH:mm:ss'))"
+          Write-Host "snapshot every ${interval}m until minute $stopSnap, chaining at minute $chaining"
+
+          while ($true) {
+            $now     = Get-Date
+            $minute  = ($now - $start).TotalMinutes
+            if ($minute -ge $loopEnd) { break }
+
+            # ---- periodic snapshot ----------------------------------------
+            if ($minute -ge $nextSnapAt -and $minute -le $stopSnap) {
+              Write-Host "[$($now.ToString('HH:mm:ss'))] snapshot due (minute $([math]::Floor($minute))/360)"
+              Invoke-Safe (Join-Path $scripts 'snapshot.ps1') 'snapshot' @('-Reason', "minute-$([math]::Floor($minute))")
+              if ($script:LastSafeExit -ne 0) {
+                $failedSnaps++
+                Write-Warning "snapshot failed ($failedSnaps problem(s)) - state unchanged until the next interval"
+              }
+              else { $failedSnaps = 0 }
+              $nextSnapAt = ((Get-Date) - $start).TotalMinutes + $interval
+            }
+
+            # ---- chain to the next VM -------------------------------------
+            if (-not $didContinue -and $minute -ge $chaining) {
+              # Reaching this point means every step so far succeeded, so the
+              # run is healthy enough to hand over.
+              $env:RUN_CONCLUSION = 'success'
+              Invoke-Safe (Join-Path $scripts 'continue.ps1') 'continue'
+              $didContinue = $true
+            }
+
+            # ---- heartbeat -------------------------------------------------
+            if ($minute -ge $nextReport) {
+              $left = [math]::Max(0, [math]::Ceiling($loopEnd - $minute))
+              Write-Host "[$($now.ToString('yyyy-MM-dd HH:mm:ss'))] VM alive - $([math]::Floor($minute)) min elapsed, ~$left min left in this session"
+              $nextReport = $minute + 5
+            }
+
+            Start-Sleep -Seconds 30
+          }
+
+          # A snapshot that overran could push us past $chaining, so the
+          # trigger is guaranteed here if it never fired inside the loop.
+          if (-not $didContinue) {
+            Write-Warning 'loop ended before the chaining deadline - triggering now'
+            $env:RUN_CONCLUSION = 'success'
+            Invoke-Safe (Join-Path $scripts 'continue.ps1') 'continue'
+          }
+
+          Write-Host ""
+          Write-Host "VM session finished after $([math]::Round(((Get-Date) - $start).TotalMinutes,1)) minutes."
+          if ($env:GITHUB_STEP_SUMMARY) {
+            $lines = @('## VM session', '', ('started `{0}`' -f $start.ToString('o')), '')
+            if ($failedSnaps -gt 0) { $lines += "> WARNING: $failedSnaps snapshot(s) failed during this session." }
+            $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      # =====================================================================
+      # Safety net for runs that end early (manual cancel, failed step). The
+      # 6-hour timeout normally kills the job outright, and that case is
+      # handled by .github/workflows/vm-autocontinue.yml instead.
+      # =====================================================================
+      - name: Chain to the next VM if this one ended early
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_CONCLUSION: ${{ job.status }}
+        run: |
+          & pwsh -NoProfile -File "$env:GITHUB_WORKSPACE/scripts/continue.ps1"
+          exit 0
