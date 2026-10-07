@@ -84,7 +84,8 @@ if (-not $SkipFiles) {
         $first = ($work | Sort-Object Name | Select-Object -First 1).FullName
         Expand-StateArchive -Archive $first -Destination 'C:\'
         Ok 'profile files restored'
-        Repair-ProfileAcl
+        # The ACL repair happens once, after the personal hive section below -
+        # that is where the profile folder may also be created from scratch.
     }
     else { Warn 'no user-profile pack in this generation' }
 }
@@ -105,12 +106,14 @@ if (-not $SkipSystem) {
 # ---------------------------------------------------------------------------
 if ($SkipMeta) {
     Log 'Skipping registry, tasks, services and environment (-SkipMeta).'
+    Repair-ProfileAcl
     exit 0
 }
 
 $metaArchive = @($assets | Where-Object { $_.Name -like ('{0}-meta.7z*' -f $generation) })
 if ($metaArchive.Count -eq 0) {
     Warn 'no meta pack in this generation - registry and settings not restored'
+    Repair-ProfileAcl
     exit 0
 }
 
@@ -136,7 +139,30 @@ $userReg   = Join-Path $regDir 'user-hive.reg'
 $userBin   = Join-Path $regDir 'user-hive.bin'
 $userKey   = Join-Path $regDir 'user-hive.key'
 
-if ((Test-Path -LiteralPath $ntUser) -and ((Test-Path $userReg) -or (Test-Path $userBin))) {
+$hiveCaptured = (Test-Path -LiteralPath $userReg) -or (Test-Path -LiteralPath $userBin)
+
+# NTUSER.DAT is held exclusively by the registry while that user is logged
+# in - which is exactly when snapshots get taken - so 7z routinely cannot
+# read it and the work pack arrives without it. The meta pack always has it,
+# because `reg save` works on a loaded hive and its output is a registry hive
+# in its own right. Put it in place before anything tries to load it,
+# otherwise Windows mints a fresh empty profile at logon and every personal
+# setting is quietly lost.
+if ($hiveCaptured -and -not (Test-Path -LiteralPath $ntUser)) {
+    if (Test-Path -LiteralPath $userBin) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ntUser) | Out-Null
+        try {
+            Copy-Item -LiteralPath $userBin -Destination $ntUser -Force -ErrorAction Stop
+            Ok 'created C:\Users\rdpuser\NTUSER.DAT from the saved hive (profile folder was empty)'
+        }
+        catch { Warn ("could not materialise NTUSER.DAT: {0}" -f $_.Exception.Message) }
+    }
+    else {
+        Warn 'personal hive was captured as .reg only and NTUSER.DAT is absent - a base hive is required to reload it.'
+    }
+}
+
+if ((Test-Path -LiteralPath $ntUser) -and $hiveCaptured) {
     $loadKey = 'VMState'
     if (Test-Path $userKey) { $loadKey = (Get-Content -LiteralPath $userKey -Raw).Trim() }
 
@@ -166,6 +192,10 @@ if ((Test-Path -LiteralPath $ntUser) -and ((Test-Path $userReg) -or (Test-Path $
     }
 }
 else { Log 'No personal hive captured yet (rdpuser has probably never logged in).' }
+
+# Runs unconditionally whenever the folder exists: 7-Zip carries no NTFS ACLs,
+# and the hive step above may have created the folder moments ago.
+Repair-ProfileAcl
 
 # --- 3. environment variables ------------------------------------------------
 $machineEnv = Join-Path $regDir 'machine-env.reg'
