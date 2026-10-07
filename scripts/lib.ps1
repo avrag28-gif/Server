@@ -99,7 +99,14 @@ function Die   ([string]$Message) { Err $Message; throw $Message }
 # ===========================================================================
 
 function Get-FreeSpaceGB {
-    param([string]$Drive = 'C')
+    param([string]$Drive)
+    # Default to the volume the state packs are written to, which is the one
+    # that actually has to fit them - on a GitHub runner that is D:, not C:.
+    if (-not $Drive) {
+        $root = $null
+        try { $root = [System.IO.Path]::GetPathRoot($CFG.StateDir) } catch { $root = $null }
+        if ($root) { $Drive = $root.TrimEnd('\') } else { $Drive = 'C' }
+    }
     try { [System.IO.DriveInfo]::new($Drive).AvailableFreeSpace / 1GB }
     catch { 0 }
 }

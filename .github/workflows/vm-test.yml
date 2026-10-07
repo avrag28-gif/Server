@@ -68,6 +68,14 @@ jobs:
 
     steps:
       # =====================================================================
+      # Everything below lives in scripts/, so the repository has to be on
+      # disk first. The previous version of this workflow kept every command
+      # inline and needed no checkout - this one does.
+      # =====================================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # =====================================================================
       - name: Show Windows VM info
         run: |
           Write-Host "=== GitHub Actions Windows Runner VM ==="
@@ -77,10 +85,15 @@ jobs:
           Write-Host "RAM (GB): $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2))"
           Get-CimInstance Win32_VideoController |
             Select-Object Name, DriverVersion, VideoModeDescription | Format-List
-          Get-PSDrive C | Select-Object @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},
-                                        @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
+          Write-Host "Storage:"
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Used -ne $null } |
+            Select-Object Name,
+                          @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},
+                          @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
             Format-Table -AutoSize
-          Write-Host "Runner temp: $env:RUNNER_TEMP"
+          Write-Host "Workspace:     $env:GITHUB_WORKSPACE"
+          Write-Host "Runner temp:   $env:RUNNER_TEMP   (state packs are built here)"
 
       # =====================================================================
       # Baseline MUST be taken on a pristine image, before anything is
