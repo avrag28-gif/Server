@@ -410,7 +410,16 @@ function Expand-StateArchive {
     $sevenZip = Get-SevenZip
     # Note: no -snld here (or in the pack path). 7-Zip 26.03 accepts the switch
     # for "a" but rejects it for "x" with exit code 7, and nothing needs it.
-    $arguments = @('x', "-o$Destination", '-y', '-bso0', '-bsp0', $Archive)
+    # WindowsApps is an OS-managed MSIX store tree. Its ACL deliberately
+    # rejects direct writes, so restoring it turns a valid snapshot into a
+    # fatal 7z exit code. Exclude it here as a second line of defence for
+    # snapshots created before the capture filter above existed.
+    $arguments = @(
+        'x', "-o$Destination", '-y', '-bso0', '-bsp0',
+        '-xr!Program Files\\WindowsApps\\*',
+        '-xr!Program Files (x86)\\WindowsApps\\*',
+        $Archive
+    )
     & $sevenZip @arguments
     $code = $LASTEXITCODE
 
