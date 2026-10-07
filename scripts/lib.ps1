@@ -149,6 +149,7 @@ $EXCLUDE_REGEX = '(?i)(' + (@(
     '\\AppData\\Local\\Packages\\[^\\]+\\TempState\\'
     '\\Program Files\\WindowsApps\\'
     '\\Program Files (x86)\\WindowsApps\\'
+    '\\ProgramData\\Microsoft\\Windows\\AppRepository\\'
     '\\__pycache__\\'
     '\\\.cache\\'
     '\\node_modules\\\.cache\\'
@@ -418,8 +419,8 @@ function Expand-StateArchive {
     # snapshots created before the capture filter above existed.
     $arguments = @(
         'x', "-o$Destination", '-y', '-bso0', '-bsp0',
-        '-xr!Program Files\\WindowsApps\\*',
-        '-xr!Program Files (x86)\\WindowsApps\\*',
+        '-xr!*\\WindowsApps\\*',
+        '-xr!*\\AppRepository\\*',
         $Archive
     )
     & $sevenZip @arguments
