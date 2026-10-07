@@ -169,21 +169,55 @@ try {
 
     # ---------------------------------------------------------------------
     Step 'Generation pruning logic'
+    # The names here must be what New-GenerationId + snapshot.ps1 actually
+    # produce. An earlier version of this test used a "gen-" prefix that never
+    # existed in production and reimplemented the grouping inline, so it passed
+    # while the real function matched nothing and never pruned a single asset.
     $fakeAssets = @(
-        @{ name = 'gen-20260101-000000-work.7z.001' },
-        @{ name = 'gen-20260101-000000-sys.7z.001' },
-        @{ name = 'gen-20260102-000000-work.7z.001' },
-        @{ name = 'gen-20260103-000000-work.7z.001' },
-        @{ name = 'gen-20260103-000000-meta.7z' },
+        @{ name = '20260101-000000-work.7z.001' },
+        @{ name = '20260101-000000-sys.7z.001' },
+        @{ name = '20260102-000000-work.7z.001' },
+        @{ name = '20260103-000000-work.7z.001' },
+        @{ name = '20260103-000000-meta.7z' },
         @{ name = 'baseline.7z' },
         @{ name = 'manifest.json' }
     ) | ForEach-Object { [pscustomobject]$_ }
-    $groups = @($fakeAssets | Where-Object { $_.name -like 'gen-*' } |
-        Group-Object { ($_.name -split '-work|-sys|-meta')[0] } | Sort-Object Name -Descending)
-    Assert ($groups.Count -eq 3) "3 generations grouped (got $($groups.Count))"
-    $keep = @($groups | Select-Object -Skip $CFG.KeepGens)
-    Assert ($keep.Count -eq 1) "KeepGens=$($CFG.KeepGens) leaves 1 generation to prune (got $($keep.Count))"
-    Assert ($keep[0].Name -eq 'gen-20260101-000000') 'oldest generation is the one selected for pruning'
+
+    $stale = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260103-000000' -Keep $CFG.KeepGens)
+    $names = @($stale | ForEach-Object { $_.name } | Sort-Object)
+    Assert ($names.Count -eq 2) "KeepGens=$($CFG.KeepGens) prunes the 2 oldest assets (got $($names.Count): $($names -join ', '))"
+    Assert (@($names | Where-Object { $_ -like '20260101-*' }).Count -eq 2) 'the oldest generation is the one selected for pruning'
+    Assert (@($names | Where-Object { $_ -in @('baseline.7z', 'manifest.json') }).Count -eq 0) 'baseline.7z and manifest.json are never pruned'
+    Assert (@($names | Where-Object { $_ -notlike '20260101-*' }).Count -eq 0) 'the two newest generations are kept'
+
+    $guard = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260101-000000' -Keep $CFG.KeepGens)
+    Assert (@($guard | Where-Object { $_.name -like '20260101-*' }).Count -eq 0) 'the live generation is never pruned, even if it is the oldest'
+
+    $single = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260103-000000' -Keep 99)
+    Assert ($single.Count -eq 0) 'a Keep larger than the generation count prunes nothing'
+
+    # ---------------------------------------------------------------------
+    Step 'Meta signature is content-addressed, not mtime-addressed'
+    $metaFixture = Join-Path $scratch 'meta-sig'
+    New-Item -ItemType Directory -Force -Path $metaFixture | Out-Null
+
+    Set-Content -LiteralPath (Join-Path $metaFixture 'a.reg') -Value '[HKLM\Test]' -Encoding utf8
+    $before = Get-MetaContentSignature -Root $metaFixture
+    # The tree is rebuilt every snapshot, so its mtimes are always "now".
+    (Get-Item (Join-Path $metaFixture 'a.reg')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddMinutes(9)
+    Assert ((Get-MetaContentSignature -Root $metaFixture) -eq $before) 'mtime alone does not change the signature'
+
+    # A length tally would miss this: a value flipping 3 -> 4 keeps the size.
+    Set-Content -LiteralPath (Join-Path $metaFixture 'b.reg') -Value 'Start=3' -Encoding utf8 -NoNewline
+    $s3 = Get-MetaContentSignature -Root $metaFixture
+    Set-Content -LiteralPath (Join-Path $metaFixture 'b.reg') -Value 'Start=4' -Encoding utf8 -NoNewline
+    Assert ((Get-Item (Join-Path $metaFixture 'b.reg')).Length -eq 7) 'fixture really is length-stable'
+    Assert ((Get-MetaContentSignature -Root $metaFixture) -ne $s3) 'a same-length content change is caught'
+
+    Set-Content -LiteralPath (Join-Path $metaFixture 'user-hive.bin') -Value 'opaque' -Encoding ascii -NoNewline
+    $withBin = Get-MetaContentSignature -Root $metaFixture
+    Remove-Item -LiteralPath (Join-Path $metaFixture 'user-hive.bin')
+    Assert ($withBin -eq (Get-MetaContentSignature -Root $metaFixture)) 'user-hive.bin is excluded from the digest'
 
     # ---------------------------------------------------------------------
     Step 'Volume size stays under GitHub 2GiB per-asset cap'

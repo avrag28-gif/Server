@@ -4,18 +4,20 @@
 
     Three packs are produced for each generation:
 
-        gen-<id>-work.7z.*   C:\Users\rdpuser, verbatim
+        <id>-work.7z.*       C:\Users\rdpuser, verbatim
                              (projects, documents, downloads, app settings,
                               NTUSER.DAT, hidden and system files included)
-        gen-<id>-sys.7z.*    Program Files / Program Files (x86) / ProgramData
+        <id>-sys.7z.*        Program Files / Program Files (x86) / ProgramData
                              as a DELTA against the pristine baseline - only
                              what you installed or changed
-        gen-<id>-meta.7z     registry hives, the RDP user's personal hive,
+        <id>-meta.7z         registry hives, the RDP user's personal hive,
                              scheduled tasks, service start types, environment
                              variables and package manifests
 
-    The whole set is skipped when its content hash matches the last published
-    generation, so an idle VM costs nothing.
+    Packing and upload are skipped when the content digest matches the last
+    published generation, so a genuinely untouched VM re-uploads nothing. The
+    inventory and registry exports still run - they are what produce the
+    digest in the first place.
 #>
 param(
     [switch]$Force,        # publish even when nothing changed
@@ -201,9 +203,7 @@ $sysLines  = ($sysPaths  | ForEach-Object {
         $f = Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue
         if ($f) { '{0}|{1}|{2}' -f $f.FullName, $f.Length, $f.LastWriteTimeUtc.Ticks }
     }) -join "`n"
-$metaLines = (Get-ChildItem -LiteralPath $metaRoot -Recurse -File | ForEach-Object {
-        '{0}|{1}|{2}' -f $_.FullName.Substring($metaRoot.Length), $_.Length, $_.LastWriteTimeUtc.Ticks
-    }) -join "`n"
+$metaLines = Get-MetaContentSignature -Root $metaRoot
 
 # Chain and endpoint are resolved BEFORE the signature check. They are kept out
 # of the hash deliberately: a new run restores a byte-identical profile but

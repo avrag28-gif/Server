@@ -13,9 +13,9 @@
         tag  : vm-state
         base : baseline.7z            <- manifest of the pristine runner image
                manifest.json           <- pointer to the newest generation
-               gen-<id>-work.7z.001..  <- full copy of C:\Users\rdpuser
-               gen-<id>-sys.7z.001..   <- delta of Program Files / ProgramData
-               gen-<id>-meta.7z        <- registry, tasks, services, env, package lists
+               <id>-work.7z.001..      <- full copy of C:\Users\rdpuser
+               <id>-sys.7z.001..       <- delta of Program Files / ProgramData
+               <id>-meta.7z            <- registry, tasks, services, env, package lists
 
     GitHub caps a single release asset at 2 GiB (1000 assets per release, no
     total size or bandwidth limit), so archives are written with 1900 MiB
@@ -438,6 +438,75 @@ function Remove-StateAsset {
     if ($LASTEXITCODE -ne 0) { Warn ("could not delete asset {0}: {1}" -f $Name, ($output -join ' ')) }
 }
 
+function Get-MetaContentSignature {
+    <#
+        Digests a freshly generated meta tree by content.
+
+        The tree is rebuilt from scratch on every snapshot, so its mtimes are
+        always "now". Feeding those into the change signature - as work and sys
+        correctly do for files sitting still on disk - made it differ on every
+        single snapshot, so the skip advertised in snapshot.ps1 never once
+        fired. Byte digests stay put when nothing moved.
+
+        A length tally would not do instead: hklm-services.reg and services.csv
+        were both observed changing content between two snapshots while their
+        size stayed identical, so path|length would quietly swallow a real
+        settings change.
+
+        user-hive.bin is excluded: it is a byte mirror of user-hive.reg, which
+        the digest already covers, and reg save output is not promised to be
+        stable between saves - including it would re-import the volatility.
+        Entries are sorted so directory enumeration order cannot wobble it.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root)) { return '' }
+
+    $entries = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
+        Where-Object { $_.Name -ne 'user-hive.bin' } |
+        ForEach-Object { [pscustomobject]@{ Rel = $_.FullName.Substring($Root.Length); File = $_ } } |
+        Sort-Object Rel)
+
+    ($entries | ForEach-Object {
+            '{0}|{1}' -f $_.Rel, (Get-FileHash -LiteralPath $_.File.FullName -Algorithm SHA256).Hash
+        }) -join "`n"
+}
+
+function Get-StaleStateAssets {
+    <#
+        Returns the assets belonging to generations older than the newest $Keep,
+        never touching the generation that is currently live.
+
+        Takes plain asset objects instead of reading the release, so the naming
+        contract can be exercised offline against exactly the names GitHub
+        reports. Anything that does not look like a generation - notably
+        baseline.7z and manifest.json - is never returned.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assets,
+        [Parameter(Mandatory)][string]$CurrentGeneration,
+        [int]$Keep = 2
+    )
+
+    # New-GenerationId returns yyyyMMdd-HHmmss, so state assets are named
+    # 20261007-063202-sys.7z.001. Matching that shape rather than a prefix is
+    # what leaves the two permanent files out of the calculation.
+    $state = @($Assets | Where-Object { $_.name -match '^\d{8}-\d{6}-(work|sys|meta)\.7z' })
+    if ($state.Count -eq 0) { return @() }
+
+    $groups = @($state | Group-Object { ($_.name -split '-work|-sys|-meta')[0] } |
+        Sort-Object Name -Descending)
+
+    if ($groups.Count -le $Keep) { return @() }
+
+    $stale = @()
+    foreach ($generation in ($groups | Select-Object -Skip $Keep)) {
+        if ($generation.Name -eq $CurrentGeneration) { continue }
+        $stale += @($generation.Group)
+    }
+    return $stale
+}
+
 function Prune-StateGenerations {
     <#
         Keeps only the newest $CFG.KeepGens generations, deleting older assets
@@ -445,20 +514,14 @@ function Prune-StateGenerations {
     #>
     param([Parameter(Mandatory)][string]$CurrentGeneration)
 
-    $assets = @(Get-StateAssets -Pattern 'gen-*')
-    if ($assets.Count -eq 0) { return }
-
-    $groups = @($assets | Group-Object { ($_.name -split '-work|-sys|-meta')[0] } |
-        Sort-Object Name -Descending)
-
-    if ($groups.Count -le $CFG.KeepGens) { return }
-
-    foreach ($stale in ($groups | Select-Object -Skip $CFG.KeepGens)) {
-        if ($stale.Name -eq $CurrentGeneration) { continue }
-        foreach ($asset in $stale.Group) {
-            Log ("  pruning {0}" -f $asset.name)
-            Remove-StateAsset -Name $asset.name
-        }
+    $params = @{
+        Assets            = @(Get-StateAssets)
+        CurrentGeneration = $CurrentGeneration
+        Keep              = $CFG.KeepGens
+    }
+    foreach ($asset in @(Get-StaleStateAssets @params)) {
+        Log ("  pruning {0}" -f $asset.name)
+        Remove-StateAsset -Name $asset.name
     }
 }
 
