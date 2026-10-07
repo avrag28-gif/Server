@@ -60,6 +60,7 @@ jobs:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
       VM_CONTINUE: ${{ vars.VM_CONTINUE }}
       VM_MAX_CHAIN: ${{ vars.VM_MAX_CHAIN }}
+      VM_KEEP_GENS: ${{ vars.VM_KEEP_GENS }}
       SNAPSHOT_INTERVAL: ${{ vars.SNAPSHOT_INTERVAL || '20' }}
       SNAPSHOT_STOP_AFTER: ${{ vars.SNAPSHOT_STOP_AFTER || '330' }}
       CONTINUE_AT: ${{ vars.CONTINUE_AT || '340' }}

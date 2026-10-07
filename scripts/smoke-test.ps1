@@ -183,18 +183,23 @@ try {
         @{ name = 'manifest.json' }
     ) | ForEach-Object { [pscustomobject]$_ }
 
-    $stale = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260103-000000' -Keep $CFG.KeepGens)
+    # Keep is passed explicitly rather than reading $CFG.KeepGens: these checks
+    # assert what the function does for a known retention window, and a config
+    # default large enough to keep everything would make them vacuously pass.
+    $stale = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260103-000000' -Keep 2)
     $names = @($stale | ForEach-Object { $_.name } | Sort-Object)
-    Assert ($names.Count -eq 2) "KeepGens=$($CFG.KeepGens) prunes the 2 oldest assets (got $($names.Count): $($names -join ', '))"
+    Assert ($names.Count -eq 2) "Keep=2 prunes the 2 oldest assets (got $($names.Count): $($names -join ', '))"
     Assert (@($names | Where-Object { $_ -like '20260101-*' }).Count -eq 2) 'the oldest generation is the one selected for pruning'
     Assert (@($names | Where-Object { $_ -in @('baseline.7z', 'manifest.json') }).Count -eq 0) 'baseline.7z and manifest.json are never pruned'
     Assert (@($names | Where-Object { $_ -notlike '20260101-*' }).Count -eq 0) 'the two newest generations are kept'
 
-    $guard = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260101-000000' -Keep $CFG.KeepGens)
+    $guard = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260101-000000' -Keep 2)
     Assert (@($guard | Where-Object { $_.name -like '20260101-*' }).Count -eq 0) 'the live generation is never pruned, even if it is the oldest'
 
     $single = @(Get-StaleStateAssets -Assets $fakeAssets -CurrentGeneration '20260103-000000' -Keep 99)
     Assert ($single.Count -eq 0) 'a Keep larger than the generation count prunes nothing'
+
+    Assert ([int]$CFG.KeepGens -ge 1) "KeepGens is a usable positive integer (got '$($CFG.KeepGens)')"
 
     # ---------------------------------------------------------------------
     Step 'Meta signature is content-addressed, not mtime-addressed'

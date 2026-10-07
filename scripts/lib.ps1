@@ -44,9 +44,14 @@ $CFG = [ordered]@{
     # 7z compression level (0-9). 3 is a good balance for a snapshot that
     # re-runs every 20 minutes; raise it if your packs are large and slow.
     Level           = 3
-    # How many complete generations to keep on the release (1 = current,
-    # extras are only there in case the newest one got corrupted mid-upload).
-    KeepGens        = 2
+    # How many complete generations to keep on the release. Each generation is
+    # a full point-in-time state, so these are your rollback points - 12 covers
+    # a whole working day at the default 20-minute interval instead of the ~45
+    # minutes that a value of 2 gave you. GitHub releases impose no total size
+    # or bandwidth limit, so a deeper history costs only asset slots (1000 per
+    # release, and a generation uses 3). Override with the VM_KEEP_GENS
+    # repository variable.
+    KeepGens        = if ($env:VM_KEEP_GENS) { [int]$env:VM_KEEP_GENS } else { 12 }
 
     StateDir        = Join-Path $tempRoot 'vmstate'
     BuildDir        = Join-Path $tempRoot 'vmstate\build'
