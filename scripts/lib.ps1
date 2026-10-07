@@ -147,6 +147,8 @@ $EXCLUDE_REGEX = '(?i)(' + (@(
     '\\AppData\\Local\\Microsoft\\Windows\\INetCache\\'
     '\\AppData\\Local\\Microsoft\\Windows\\Explorer\\(thumb|icon)cache[^\\]*\.db$'
     '\\AppData\\Local\\Packages\\[^\\]+\\TempState\\'
+    '\\Program Files\\WindowsApps\\'
+    '\\Program Files (x86)\\WindowsApps\\'
     '\\__pycache__\\'
     '\\\.cache\\'
     '\\node_modules\\\.cache\\'
