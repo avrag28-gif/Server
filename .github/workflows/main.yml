@@ -1,0 +1,990 @@
+name: Windows RDP Smooth 7D
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'ISO timestamp of the first chained run (set automatically; leave blank for a new session)'
+        type: string
+        required: false
+        default: ''
+
+# GitHub hard-caps every hosted job at 6 hours, so a multi-day session is built
+# as a CHAIN: each run keeps RDP alive for ~5h20m, then dispatches the next run
+# (needs actions: write) passing along the original start timestamp. The chain
+# stops after RDP_DAYS days (repository variable, default 7; set 0 to stop now).
+# Overall session = N * ~5.7h cycles, each cycle has a ~3-5 minute RDP gap.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rdp:
+    # Standard GitHub runners only live in US Azure regions (~200 ms from
+    # Indonesia). To actually get a smooth session, override this with a runner
+    # that is physically closer to you:
+    #   Settings > Secrets and variables > Actions > Variables > New variable
+    #   Name: RDP_RUNNER   Value: a self-hosted label, or a larger runner label
+    #   such as 'gpu-larger' / an Asia-region runner created through Azure
+    #   private networking (Japan West is a supported region).
+    # Use RDP_RUNNER for a persistent self-hosted Windows VM; otherwise keep the GitHub-hosted fallback.
+    runs-on: ${{ vars.RDP_RUNNER || 'windows-2025' }}
+    timeout-minutes: 360
+    env:
+      # Transport 1 (default): Tailscale. Requires the TS_AUTHKEY secret.
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      # Transport 2 (optional): Cloudflare Tunnel, an alternative to Tailscale.
+      # Requires a Cloudflare tunnel whose public hostname is type TCP and
+      # points at localhost:3389. If Tailscale is not configured, this becomes
+      # the only transport, so it must be set in that case.
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+
+    steps:
+      - name: Inspect runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          Write-Host "=== WINDOWS ==="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "=== CPU ==="
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors, MaxClockSpeed | Format-List
+          Write-Host "=== RAM ==="
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("RAM_GB={0}" -f [math]::Round($cs.TotalPhysicalMemory / 1GB, 2))
+          Write-Host "=== GPU ==="
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, VideoModeDescription, AdapterRAM, Status | Format-List
+          Write-Host "=== NETWORK ==="
+          Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object Name, InterfaceDescription, LinkSpeed | Format-List
+
+      - name: Kill background CPU hogs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          # --- Windows Defender: the single biggest CPU consumer on hosted runners ---
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Set-MpPreference -DisableScriptScanning $true
+          Set-MpPreference -DisableIOAVProtection $true
+          Set-MpPreference -DisableArchiveScanning $true
+          Set-MpPreference -DisableScanningNetworkFiles $true
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Add-MpPreference -ExclusionPath "C:\" -ErrorAction SilentlyContinue
+          $defKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+          New-Item -Path $defKey -Force | Out-Null
+          New-ItemProperty -Path $defKey -Name DisableAntiSpyware -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # --- Windows Update / Delivery Optimization: never let them run mid-session ---
+          foreach ($svc in @("wuauserv", "UsoSvc", "WaaSMedicSvc", "DoSvc", "SgrmBroker")) {
+            & sc.exe stop $svc | Out-Null
+            & sc.exe config $svc start= disabled | Out-Null
+          }
+          foreach ($taskPath in @(
+              "\Microsoft\Windows\WindowsUpdate\*",
+              "\Microsoft\Windows\InstallService\*",
+              "\Microsoft\Windows\UpdateOrchestrator\*",
+              "\Microsoft\Windows\Defrag\*",
+              "\Microsoft\Windows\DiskDiagnostic\*",
+              "\Microsoft\Windows\Maintenance\*",
+              "\Microsoft\Windows\Feedback\*",
+              "\Microsoft\Windows\Application Experience\*",
+              "\Microsoft\Windows\Customer Experience Improvement Program\*",
+              # Defender's own scheduled scans and WER uploads are steady CPU hogs.
+              "\Microsoft\Windows\Windows Defender\*",
+              "\Microsoft\Windows\Windows Error Reporting\*",
+              "\Microsoft\Windows\Diagnosis\*")) {
+            Get-ScheduledTask -TaskPath $taskPath | Disable-ScheduledTask | Out-Null
+          }
+
+          # --- Kill always-on bloat processes ---
+          $processes = @("OneDrive", "Teams", "ms-teams", "Widgets", "GameBar", "GameBarFTServer",
+                         "YourPhone", "PhoneExperienceHost", "Copilot", "MicrosoftEdgeUpdate",
+                         # Search indexers and security UI redraw loops burn CPU for nothing.
+                         "SearchApp", "SearchHost", "SearchUI", "SecurityHealthSystray",
+                         "SecurityHealth", "SecHealthUI", "OfficeClickToRun", "AdobeARMservice")
+          foreach ($procName in $processes) {
+            Get-Process -Name $procName -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          # --- Disable the auto-start of the worst offenders ---
+          $runKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+          foreach ($name in @("OneDrive", "MicrosoftEdgeAutoLaunch", "Teams")) {
+            Remove-ItemProperty -Path $runKey -Name $name -ErrorAction SilentlyContinue
+          }
+          Write-Host "Background CPU hogs neutralized."
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: Apply high-performance tuning
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          # --- Power: never throttle, never sleep ---
+          powercfg /setactive SCHEME_MIN
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /h off
+
+          # --- CPU: pin the floor at 100%, never park cores, always boost ---
+          # GitHub runners are 4-vCPU VMs; a parked or throttled core shows up as
+          # RDP encode stutter. These silently no-op if the SKU lacks the setting.
+          foreach ($idx in @(
+              "PROCTHROTTLEMIN", "PROCTHROTTLEMAX",   # min/max processor state
+              "CPMINCORES", "CPMAXCORES",             # core parking floor/ceiling
+              "PERFBOOSTMODE", "PERFAUTOPARAMETER")) { # turbo behaviour
+            powercfg /setacvalueindex SCHEME_MIN SUB_PROCESSOR $idx 100 2>$null
+          }
+          powercfg /setacvalueindex SCHEME_MIN SUB_PROCESSOR PERFBOOSTMODE 2 2>$null
+          powercfg /setactive SCHEME_MIN
+
+          # --- Prioritize foreground apps (38 = 2:1:1, best for interactive) ---
+          $priorityKey = "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl"
+          New-Item -Path $priorityKey -Force | Out-Null
+          New-ItemProperty -Path $priorityKey -Name Win32PrioritySeparation -PropertyType DWord -Value 38 -Force | Out-Null
+
+          # --- Multimedia: remove network throttling and system responsiveness float ---
+          $mm = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+          New-Item -Path $mm -Force | Out-Null
+          New-ItemProperty -Path $mm -Name NetworkThrottlingIndex -PropertyType DWord -Value 0xffffffff -Force | Out-Null
+          New-ItemProperty -Path $mm -Name SystemResponsiveness -PropertyType DWord -Value 0 -Force | Out-Null
+
+          # --- TCP latency tuning (RDP is latency sensitive) ---
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled | Out-Null
+          netsh int tcp set global chimney=disabled | Out-Null
+          netsh int tcp set heuristics disabled | Out-Null
+          netsh int tcp set global timestamps=disabled | Out-Null
+          netsh int tcp set global netdma=disabled | Out-Null
+          netsh int tcp set global initialrto=1000 | Out-Null
+
+          # --- NIC: never let the adapter sleep or enter power-saving states ---
+          # A single green-ethernet renegotiation mid-session looks like an RDP freeze.
+          Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
+            Disable-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue
+            Disable-NetAdapterLso -Name $_.Name -ErrorAction SilentlyContinue
+            foreach ($disp in @("Energy Efficient Ethernet", "Green Ethernet",
+                                "Energy-Efficient Ethernet", "Power Saving Mode")) {
+              Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName $disp `
+                -DisplayValue Disabled -ErrorAction SilentlyContinue
+            }
+          }
+
+          # --- Windows Search / Cortana / web search: pure background CPU ---
+          $ws = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search"
+          New-Item -Path $ws -Force | Out-Null
+          foreach ($pair in @{
+              AllowCortana          = 0
+              DisableWebSearch      = 1
+              ConnectedSearchUseWeb = 0
+              AllowSearchToUseLocation = 0
+              EnableIndexerWarmup   = 0 }.GetEnumerator()) {
+            New-ItemProperty -Path $ws -Name $pair.Key -PropertyType DWord -Value $pair.Value -Force | Out-Null
+          }
+
+          # --- Unneeded services: stop and disable ---
+          $services = @(
+            "DiagTrack", "dmwappushservice", "MapsBroker", "SysMain", "WSearch", "Fax",
+            "RetailDemo", "XblAuthManager", "XblGameSave", "XboxGipSvc", "XboxNetApiSvc",
+            "lfsvc", "WerSvc", "TabletInputService", "SCardSvr", "BluetoothUserService",
+            "RemoteRegistry", "SharedAccess", "WbioSrvc", "SEMgrSvc", "SensorService",
+            "SensrSvc", "RemoteAccess", "PrintNotify", "Spooler",
+            # push notifications, file history, program-compat telemetry, data sharing:
+            # none of them matter inside a throwaway 6-hour RDP session.
+            "WpnService", "WpnUserService", "fhsvc", "PcaSvc", "DsSvc", "wisvc"
+          )
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # --- RDP policy: strip every visual feature that adds encode work ---
+          $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $rdpPolicy -Force | Out-Null
+          $rdpDword = @{
+            # Visual features: every one of these removes encode work per frame.
+            fDisableWallpaper            = 1
+            fNoRemoteDesktopWallpaper    = 1   # the real ADMX name for "no wallpaper"
+            fDisableFullWindowDrag       = 1
+            fDisableMenuAnims            = 1
+            fDisableThemes               = 1
+            fDisableCursorSetting        = 1
+            fDisableCursorShadow         = 1
+            fDisableCursorBlinking       = 1
+            # Redirection: each open channel costs CPU at sign-in and bandwidth after.
+            fDisableCdm                  = 1   # drives
+            fDisableCcm                  = 1   # COM ports
+            fDisableLPT                  = 1   # LPT ports
+            fDisableCpm                  = 1   # printers
+            fDisablePNPRedir             = 1   # plug and play devices
+            fDisableAudioCapture         = 1   # microphone
+            # No GPU on GitHub runners, so never advertise a hardware codec path.
+            UseWddmGraphicsDisplayDriver = 1
+            UseRdpCompression            = 1
+            AVC444ModePreferred          = 0
+            AVCHardwareEncodePreferred   = 0
+            # A single monitor keeps the frame size predictable.
+            MaxMonitors                  = 1
+            # Cap the colour depth at 16-bit. Windows 8+ clients ignore this, so the
+            # .rdp profile below also sets 'session bpp:i:16' explicitly.
+            ColorDepth                   = 3
+            # Ask for the leaner compression profile (Bandwidth is the bottleneck
+            # on a relayed/DERP path, CPU is not the limiting factor here).
+            RDPCompression               = 2
+            # Never kill or lock the session while the user is away.
+            MaxIdleTime                  = 0
+            MaxDisconnectionTime         = 0
+            MaxConnectionTime            = 0
+            fResetBroken                 = 0
+          }
+          foreach ($pair in $rdpDword.GetEnumerator()) {
+            New-ItemProperty -Path $rdpPolicy -Name $pair.Key -PropertyType DWord -Value $pair.Value -Force | Out-Null
+          }
+          Remove-ItemProperty -Path $rdpPolicy -Name SelectTransport -ErrorAction SilentlyContinue
+
+          # --- No GPU on the runner: don't advertise hardware GPU scheduling ---
+          $graphicsKey = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+          Remove-ItemProperty -Path $graphicsKey -Name HwSchMode -ErrorAction SilentlyContinue
+
+          # --- Telemetry policy: nothing to phone home, nothing to burn CPU ---
+          $policies = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
+          New-Item -Path $policies -Force | Out-Null
+          New-ItemProperty -Path $policies -Name AllowTelemetry -PropertyType DWord -Value 0 -Force | Out-Null
+
+          # --- Game capture / Game Bar: screen capture running for nothing ---
+          foreach ($k in @(
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR",
+              "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers")) {
+            New-Item -Path $k -Force | Out-Null
+          }
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" `
+            -Name AppCaptureEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+
+          # --- Temp cleanup: less disk churn ---
+          Get-ChildItem "$env:TEMP\*" -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "C:\Windows\Temp\*" -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "System-level performance tuning complete."
+
+      - name: Apply default-user profile tuning
+        shell: pwsh
+        run: |
+          # The RDP user gets a brand new profile at first logon, built from the
+          # Default hive. Tuning the current runner account does nothing for them,
+          # so we bake the "best performance" profile into Default\NTUSER.DAT.
+          $ErrorActionPreference = "SilentlyContinue"
+          $hive = "C:\Users\Default\NTUSER.DAT"
+          $mount = "HKU\RdpTune"
+
+          & reg.exe unload $mount 2>$null | Out-Null
+          & reg.exe load $mount $hive | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Failed to load the Default user hive." }
+
+          $software = "$mount\Software\Microsoft\Windows\CurrentVersion"
+          $explorer = "$software\Explorer"
+          $desktop  = "$mount\Control Panel\Desktop"
+          $dwm      = "$mount\Software\Microsoft\Windows\DWM"
+
+          # Best performance / no animations
+          & reg.exe add "$explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+          & reg.exe add "$explorer\VisualEffects" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v ListviewAlphaSelect /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v ListviewShadow /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v ListviewWatermark /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v DesktopProcess /t REG_DWORD /d 1 /f | Out-Null
+          & reg.exe add "$explorer\Advanced" /v NoInstrumentation /t REG_DWORD /d 1 /f | Out-Null
+          & reg.exe add "$desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+          & reg.exe add "$desktop" /v DragFullWindows /t REG_SZ /d 0 /f | Out-Null
+          & reg.exe add "$desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+          & reg.exe add "$desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+
+          # No transparency / no Aero peek / no thumbnails
+          & reg.exe add "$mount\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add $dwm /v EnableAeroPeek /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add $dwm /v AlwaysHibernateThumbnails /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add $dwm /v Composition /t REG_DWORD /d 0 /f | Out-Null
+
+          # Suppress first-logon bloat and suggestion content
+          & reg.exe add "$mount\Software\Microsoft\Windows\CurrentVersion\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 0 /f | Out-Null
+          & reg.exe add "$mount\System\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 0 /f | Out-Null
+          $cdm = "$mount\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+          foreach ($n in @(
+              "SubscribedContent-338389Enabled", "SubscribedContent-338388Enabled",
+              "SubscribedContent-338393Enabled", "SubscribedContent-310093Enabled",
+              "SilentInstalledAppsEnabled", "SystemPaneSuggestionsEnabled",
+              "SoftLandingEnabled", "RotatingLockScreenOverlayEnabled")) {
+            & reg.exe add $cdm /v $n /t REG_DWORD /d 0 /f | Out-Null
+          }
+          & reg.exe add "$mount\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDriveSetup /t REG_SZ /d "" /f | Out-Null
+
+          & reg.exe unload $mount | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Start-Sleep -Seconds 2
+            & reg.exe unload $mount | Out-Null
+          }
+          Write-Host "Default user profile tuned for best performance."
+
+      - name: Configure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Missing GitHub Actions secret: RDP_PASSWORD" }
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue
+          if ($user) {
+            Set-LocalUser -Name "rdpuser" -Password $securePassword
+            Enable-LocalUser -Name "rdpuser"
+          } else {
+            New-LocalUser -Name "rdpuser" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires -Description "Temporary RDP user"
+          }
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            try { Add-LocalGroupMember -Group $group -Member "rdpuser" -ErrorAction Stop } catch { }
+          }
+
+          $terminalServer = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          New-ItemProperty -Path $terminalServer -Name fDenyTSConnections -PropertyType DWord -Value 0 -Force | Out-Null
+          # Explicitly enable RDP through Terminal Services management API.
+          $ts = Get-CimInstance -Namespace "root/CIMV2/TerminalServices" -ClassName Win32_TerminalServiceSetting -ErrorAction SilentlyContinue
+          if ($ts) { Invoke-CimMethod -InputObject $ts -MethodName SetAllowTSConnections -Arguments @{AllowTSConnections=1;ModifyFirewallException=1} -ErrorAction SilentlyContinue | Out-Null }
+
+          $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          if (-not (Test-Path $rdpTcp)) { throw "RDP-Tcp registry configuration is missing." }
+          New-ItemProperty -Path $rdpTcp -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpTcp -Name SecurityLayer -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpTcp -Name MinEncryptionLevel -PropertyType DWord -Value 3 -Force | Out-Null
+          New-ItemProperty -Path $rdpTcp -Name PortNumber -PropertyType DWord -Value 3389 -Force | Out-Null
+          New-ItemProperty -Path $rdpTcp -Name KeepAliveInterval -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpTcp -Name KeepAliveEnable -PropertyType DWord -Value 1 -Force | Out-Null
+          # Ensure the RDP listener components are enabled on Windows Server 2025.
+          # TermService can be running while the RDP-Tcp listener remains disabled.
+          New-ItemProperty -Path $rdpTcp -Name fEnableWinStation -PropertyType DWord -Value 1 -Force | Out-Null
+          foreach ($svcName in @("SessionEnv", "UmRdpService")) {
+            Set-Service -Name $svcName -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $svcName -ErrorAction SilentlyContinue
+          }
+
+          # Configure the actual Terminal Services RDP-Tcp endpoint through WMI/CIM.
+          # Registry flags alone can leave TermService running with no listener.
+          $tsSetting = Get-CimInstance -Namespace "root/CIMV2/TerminalServices" -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
+          $allowResult = Invoke-CimMethod -InputObject $tsSetting -MethodName SetAllowTSConnections -Arguments @{AllowTSConnections=1;ModifyFirewallException=1} -ErrorAction Stop
+          Write-Host ("SetAllowTSConnections ReturnValue={0}" -f $allowResult.ReturnValue)
+
+          $tsGeneral = Get-CimInstance -Namespace "root/CIMV2/TerminalServices" -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-Tcp'" -ErrorAction Stop
+          Invoke-CimMethod -InputObject $tsGeneral -MethodName SetUserAuthenticationRequired -Arguments @{UserAuthenticationRequired=1} -ErrorAction Stop | Out-Null
+          Invoke-CimMethod -InputObject $tsGeneral -MethodName SetSecurityLayer -Arguments @{SecurityLayer=1} -ErrorAction Stop | Out-Null
+          # EncryptionLevel remains 3 via the RDP-Tcp registry setting; this WMI class does not expose SetEncryptionLevel on Server 2025.
+          # 0 = use both TCP and UDP. UDP transport is what keeps RDP responsive on
+          # lossy/relay paths; without it every dropped packet stalls a TCP window.
+          New-ItemProperty -Path $rdpTcp -Name SelectTransport -PropertyType DWord -Value 0 -Force | Out-Null
+          # Draw the desktop on the server with no idle polling pressure.
+          New-ItemProperty -Path $rdpTcp -Name ColorDepth -PropertyType DWord -Value 3 -Force | Out-Null
+
+          Set-Service -Name TermService -StartupType Automatic
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-TCP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName "RDP-UDP-3389" -Direction Inbound -Protocol UDP -LocalPort 3389 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+
+          $ts = Get-Service -Name TermService
+          if ($ts.Status -ne "Running") {
+            Start-Service -Name TermService
+            Start-Sleep -Seconds 8
+          }
+
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            Restart-Service -Name TermService -Force
+            Start-Sleep -Seconds 20
+            $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          }
+
+          if (-not $listener) {
+            Write-Host "=== TERMSERVICE ==="
+            Get-Service TermService | Format-List Name,Status,StartType
+            Write-Host "=== RDP-TCP ==="
+            Get-ItemProperty $rdpTcp | Select-Object UserAuthentication,SecurityLayer,MinEncryptionLevel,PortNumber | Format-List
+            Write-Host "=== LISTENERS ==="
+            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Sort-Object LocalPort | Select-Object LocalAddress,LocalPort,OwningProcess
+            throw "RDP port 3389 is not listening."
+          }
+          Get-Service TermService | Select-Object Name,Status,StartType | Format-List
+          Get-NetTCPConnection -LocalPort 3389 -State Listen | Select-Object LocalAddress,LocalPort,State,OwningProcess
+          Write-Host "RDP is ready."
+
+      - name: Restore previous Windows state
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "${{ github.repository }}"
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2026-03-10"
+          }
+          $listing = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$repo/actions/artifacts?name=serverRd-state&per_page=100" -Headers $headers
+          $previous = $listing.artifacts | Where-Object { -not $_.expired -and $_.workflow_run.id -ne [int64]"${{ github.run_id }}" } | Sort-Object { [datetime]$_.created_at } -Descending | Select-Object -First 1
+          if (-not $previous) { Write-Host "No previous ServerRd state artifact. Starting clean."; exit 0 }
+          Write-Host ("Restoring checkpoint from run {0}" -f $previous.workflow_run.id)
+          $artifactZip = Join-Path $env:RUNNER_TEMP "serverRd-state-artifact.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "serverRd-state-artifact"
+          $state = Join-Path $env:RUNNER_TEMP "serverRd-state"
+          Remove-Item $extract,$state -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $extract,$state | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri $previous.archive_download_url -OutFile $artifactZip
+          Expand-Archive -Path $artifactZip -DestinationPath $extract -Force
+          $stateZip = Get-ChildItem $extract -Filter "serverRd-state.zip" -Recurse | Select-Object -First 1
+          if (-not $stateZip) { throw "serverRd-state.zip missing from checkpoint artifact." }
+          Expand-Archive -Path $stateZip.FullName -DestinationPath $state -Force
+
+          Stop-Service TermService -Force -ErrorAction SilentlyContinue
+          $profile = "C:\Users\rdpuser"
+          New-Item -ItemType Directory -Force -Path $profile | Out-Null
+          $hasHive = Test-Path "$state\NTUSER.DAT"
+          $profileItems = @(Get-ChildItem "$state\profile" -Recurse -File -ErrorAction SilentlyContinue)
+          $hasProfileFiles = $profileItems.Count -gt 0
+          Write-Host ("Checkpoint payload: NTUSER.DAT={0}, profile files={1}" -f $hasHive, $profileItems.Count)
+          if (-not $hasHive -and -not $hasProfileFiles -and -not (Test-Path "$state\winget.json")) {
+            throw "Checkpoint artifact contains no restorable user state."
+          }
+
+          if ($hasHive) {
+            Copy-Item "$state\NTUSER.DAT" "$profile\NTUSER.DAT" -Force
+            Write-Host "Restored NTUSER.DAT."
+          } else {
+            Write-Warning "Checkpoint has no NTUSER.DAT."
+          }
+
+          foreach ($dir in @("Desktop","Documents","Downloads","Pictures","Videos","Music","AppData\Roaming","AppData\Local")) {
+            $src = Join-Path $state "profile\$dir"; $dst = Join-Path $profile $dir
+            if (Test-Path $src) {
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              robocopy $src $dst /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+              Write-Host ("Restored profile directory: {0}" -f $dir)
+            }
+          }
+
+          if ($hasHive) {
+            $testHive = "HKU\ServerRdRestoreTest"
+            & reg.exe unload $testHive 2>$null | Out-Null
+            & reg.exe load $testHive "$profile\NTUSER.DAT" | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              & reg.exe unload $testHive | Out-Null
+              Write-Host "NTUSER.DAT hive validation: OK"
+            } else {
+              Write-Warning "NTUSER.DAT hive validation failed."
+            }
+          }
+          foreach ($regFile in (Get-ChildItem "$state\registry" -Filter *.reg -ErrorAction SilentlyContinue)) { & reg.exe import $regFile.FullName | Out-Null }
+          $wingetFile = "$state\winget.json"
+          if ((Test-Path $wingetFile) -and (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            Write-Host "Restoring WinGet applications..."
+            & winget.exe import --import-file $wingetFile --ignore-unavailable --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade
+          }
+          Start-Service TermService -ErrorAction SilentlyContinue
+          if (Test-Path "C:\Users\rdpuser") {
+            Write-Host "Restored profile contents:"
+            Get-ChildItem "C:\Users\rdpuser" -Force -ErrorAction SilentlyContinue | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+          }
+          Write-Host "Checkpoint restored. Live RAM/process state is intentionally not claimed."
+      - name: Verify at least one transport is configured
+        shell: pwsh
+        run: |
+          if (-not $env:TS_AUTHKEY -and -not $env:CF_TUNNEL_TOKEN) {
+            throw "Configure at least one transport: the TS_AUTHKEY secret (Tailscale) or the CF_TUNNEL_TOKEN secret (Cloudflare Tunnel)."
+          }
+          Write-Host ("Tailscale enabled:          " + [bool]$env:TS_AUTHKEY)
+          Write-Host ("Cloudflare Tunnel enabled:  " + [bool]$env:CF_TUNNEL_TOKEN)
+
+      - name: Install and connect Tailscale
+        if: ${{ env.TS_AUTHKEY != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            $tailscale = Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe"
+          }
+          if (-not (Test-Path $tailscale)) { throw "Tailscale executable was not found." }
+
+          $hostname = if ($env:RUNNER_ENVIRONMENT -eq "self-hosted") { "serverRd-persistent" } else { "github-serverRd-${{ github.run_id }}" }
+          & $tailscale up --auth-key="$env:TS_AUTHKEY" --hostname="$hostname" --accept-dns=false --accept-routes=false
+          Start-Sleep -Seconds 5
+
+          Write-Host "=== TAILSCALE IPv4 ==="
+          & $tailscale ip -4
+          Write-Host "=== TAILSCALE NETCHECK (look for a direct connection, not DERP) ==="
+          & $tailscale netcheck
+          Write-Host "=== TAILSCALE STATUS ==="
+          & $tailscale status
+
+      - name: Optional Cloudflare Tunnel connector
+        if: ${{ env.CF_TUNNEL_TOKEN != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cfDir = Join-Path $env:ProgramFiles "cloudflared"
+          $cf = Join-Path $cfDir "cloudflared.exe"
+          if (-not (Test-Path $cf)) {
+            New-Item -ItemType Directory -Force -Path $cfDir | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cf
+          }
+          # Runs for the whole session in its own process, so the keep-alive step
+          # below does not block it.
+          Start-Process -FilePath $cf -ArgumentList "tunnel", "--no-autoupdate", "run", "--token", "$env:CF_TUNNEL_TOKEN" -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          $running = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+          if ($running) {
+            Write-Host "cloudflared connector is running (Cloudflare Tunnel alternative is live)."
+            Write-Host "Make sure the tunnel public hostname is type TCP and points at localhost:3389."
+          } else {
+            Write-Warning "cloudflared did not start. Check the CF_TUNNEL_TOKEN secret."
+            Write-Host "Continuing with Tailscale only."
+          }
+
+      - name: Report network path and runner region
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          Write-Host "=== RUNNER AZURE REGION (physical distance beats every tune-up) ==="
+          try {
+            $meta = Invoke-RestMethod -Uri "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" -Headers @{ Metadata = "true" } -TimeoutSec 5
+            Write-Host ("AZURE_REGION = " + $meta.location)
+            Write-Host ("AZURE_ZONE   = " + $meta.zone)
+          } catch {
+            Write-Host "Azure instance metadata is not reachable from this runner."
+          }
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) { $tailscale = Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe" }
+
+          Write-Host "=== TAILSCALE CONNECTION TYPE ==="
+          if (Test-Path $tailscale) {
+            & $tailscale status
+            Write-Host ""
+            Write-Host "Look at the peer line on YOUR device: 'direct 1.2.3.4:41641' is fast,"
+            Write-Host "'relay \"xyz\"' means every RDP pixel goes through a DERP relay."
+            Write-Host "That is the number one cause of lag and no server setting can remove it."
+          }
+
+      - name: Generate client profile and relay diagnostic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) { $tailscale = Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe" }
+
+          $tsIp = ""
+          if (Test-Path $tailscale) {
+            $tsIp = (& $tailscale ip -4 | Select-Object -First 1)
+            if ($tsIp) { $tsIp = $tsIp.Trim() }
+          }
+          $tailscaleReady = -not [string]::IsNullOrWhiteSpace($tsIp)
+          if (-not $tailscaleReady) { $tsIp = "<TAILSCALE-IP>" }
+
+          # 16-bit colour is the single biggest bandwidth win, and Windows 8+ clients
+          # ignore the server-side colour depth cap, so it has to be set on the client.
+          # 'connection type:i:2' is the leanest preset: bitmap cache on, everything else off.
+          $rdp = @(
+            ("full address:s:{0}:3389" -f $tsIp),
+            "username:s:rdpuser",
+            "screen mode id:i:2",
+            "smart sizing:i:1",
+            "use multimon:i:0",
+            "desktopwidth:i:1366",
+            "desktopheight:i:768",
+            "session bpp:i:16",
+            "compression:i:1",
+            "connection type:i:2",
+            "networkautodetect:i:0",
+            "bandwidthautodetect:i:0",
+            "bitmapcachepersistenable:i:1",
+            "disable wallpaper:i:1",
+            "allow font smoothing:i:0",
+            "allow desktop composition:i:0",
+            "disable full window drag:i:1",
+            "disable menu anims:i:1",
+            "disable themes:i:1",
+            "disable cursor setting:i:1",
+            "audiomode:i:2",
+            "audiocapturemode:i:0",
+            "videoplaybackmode:i:1",
+            "redirectprinters:i:0",
+            "redirectcomports:i:0",
+            "redirectsmartcards:i:0",
+            "redirectposdevices:i:0",
+            "redirectdirectx:i:0",
+            "drivestoredirect:s:",
+            "redirectclipboard:i:1",
+            "autoreconnection enabled:i:1",
+            "authentication level:i:2",
+            "prompt for credentials:i:0",
+            "negotiate security layer:i:1",
+            "keyboardhook:i:2"
+          ) -join "`r`n"
+
+          if ($tailscaleReady) {
+            $rdpPath = Join-Path $env:GITHUB_WORKSPACE "serverRd-tuned.rdp"
+            Set-Content -Path $rdpPath -Value $rdp -Encoding ASCII
+
+            Write-Host "######### COPY EVERYTHING BETWEEN THE MARKERS INTO serverRd.rdp #########"
+            Write-Host $rdp
+            Write-Host "############################ END OF .rdp FILE ##########################"
+          } else {
+            Write-Host "Tailscale is disabled for this run, so no .rdp profile was generated."
+          }
+
+          # --- client-side script: tells you WHY Tailscale relays and fixes it ---
+          # Built as arrays of single-quoted strings so every YAML line stays
+          # indented while the generated output has no stray indentation.
+          $runnerHost = "github-serverRd-${{ github.run_id }}"
+          $connectScript = @(
+            'param([switch]$NoLaunch)',
+            '$ErrorActionPreference = "SilentlyContinue"',
+            ('$RunnerHost = "{0}"' -f $runnerHost),
+            ('$RunnerIp   = "{0}"' -f $tsIp),
+            '',
+            'Write-Host "=== ServerRd connection check ===" -ForegroundColor Cyan',
+            '',
+            '$ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"',
+            'if (-not (Test-Path $ts)) { $ts = Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe" }',
+            'if (-not (Test-Path $ts)) {',
+            '  Write-Host "Tailscale is not installed on this PC." -ForegroundColor Red',
+            '  Write-Host "Install it from https://tailscale.com/download/windows, sign in, then re-run this script."',
+            '  exit 1',
+            '}',
+            '',
+            '# The session is chained: every ~5h20m the runner VM is recreated with a new',
+            '# name and IP. Discover the newest live github-serverRd node instead of',
+            '# trusting the values baked into this file at download time.',
+            '$j = & $ts status --json 2>$null | Out-String | ConvertFrom-Json',
+            '$peer = $null',
+            'if ($j -and $j.Peer) {',
+            '  $peer = $j.Peer.PSObject.Properties.Value |',
+            '    Where-Object { $_.DNSName -like "github-serverRd*" -and ($_.Online -or $_.Status -eq "online") } |',
+            '    Select-Object -First 1',
+            '}',
+            'if ($peer) {',
+            '  $RunnerHost = $peer.DNSName.TrimEnd(".")',
+            '  $v4 = $peer.TailscaleIPs | Where-Object { $_ -match "^[0-9]+\." } | Select-Object -First 1',
+            '  if ($v4) { $RunnerIp = $v4 }',
+            '  Write-Host ("Live runner found: " + $RunnerHost + " (" + $RunnerIp + ")") -ForegroundColor Green',
+            '} else {',
+            '  Write-Host "No live github-serverRd node found yet - is the workflow running?" -ForegroundColor Yellow',
+            '  Write-Host ("Falling back to baked values: " + $RunnerHost + " (" + $RunnerIp + ")")',
+            '}',
+            '',
+            'Write-Host ""',
+            'Write-Host "--- netcheck ---" -ForegroundColor Cyan',
+            '$net = (& $ts netcheck 2>&1 | Out-String)',
+            'Write-Host $net',
+            '',
+            '$udpOk   = $net -match "UDP:\s+true"',
+            '$ipv6Ok  = $net -match "IPv6:\s+yes"',
+            '$hardNat = $net -match "MappingVariesByDestIP:\s+true"',
+            '$portMap = ($net -match "UPnP:\s+true") -or ($net -match "NAT-PMP:\s+true") -or ($net -match "PCP:\s+true") -or ($net -match "PortMapping:\s*(UPnP|NAT-PMP|PCP)")',
+            '',
+            'Write-Host "--- verdict ---" -ForegroundColor Cyan',
+            'if (-not $udpOk) {',
+            '  Write-Host "[X] Outbound UDP is blocked, so Tailscale can only relay." -ForegroundColor Red',
+            '  Write-Host "    Fix: allow outbound UDP 41641 through your firewall."',
+            '} elseif ($hardNat) {',
+            '  Write-Host "[!] Your side is a HARD NAT: the router picks a new port per destination." -ForegroundColor Yellow',
+            '  if ($portMap) { Write-Host "    OK: a port mapping protocol is available, direct is still likely." }',
+            '  else { Write-Host "    Fix: enable UPnP or NAT-PMP/PCP in your router settings." }',
+            '  if (-not $ipv6Ok) { Write-Host "    Fix: enable IPv6 - IPv6 devices connect directly almost every time." }',
+            '  Write-Host "    Note: carrier-grade NAT (CGNAT) cannot be fixed locally; ask your ISP for a public IP."',
+            '} else {',
+            '  Write-Host "[OK] Your NAT is easy and UDP works, so a direct connection is possible." -ForegroundColor Green',
+            '}',
+            '',
+            'Write-Host ""',
+            'Write-Host "--- ping the runner (watch for the switch away from DERP) ---" -ForegroundColor Cyan',
+            '& $ts ping $RunnerHost',
+            '',
+            'Write-Host ""',
+            'if (-not $NoLaunch) {',
+            '  Write-Host "Launching Remote Desktop to $RunnerIp ..." -ForegroundColor Cyan',
+            '  Start-Process mstsc.exe -ArgumentList "/v:$RunnerIp"',
+            '}'
+          ) -join "`r`n"
+
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "serverRd-connect.ps1"
+          Set-Content -Path $scriptPath -Value $connectScript -Encoding UTF8
+
+          Write-Host "###### COPY EVERYTHING BELOW INTO serverRd-connect.ps1 ######"
+          Write-Host $connectScript
+          Write-Host "######################### END OF SCRIPT #####################"
+
+          $summaryLines = @(
+            '## ServerRd is online',
+            '',
+            'Remote Desktop listens on the Tailscale address above, port **3389**, user **rdpuser**.',
+            '',
+            '### This is a chained multi-day session',
+            'GitHub kills every hosted job after 6 hours, so this run re-dispatches itself',
+            'every ~5h20m. The session keeps going for `RDP_DAYS` days (default **7**, set',
+            'the repository variable to `0` to stop after the current run). Between runs',
+            'expect a **3-5 minute gap** while the new VM boots: just re-run',
+            '`serverRd-connect.ps1` (it auto-discovers the new runner) or grab the fresh',
+            '`.rdp` profile from the newest run.',
+            '',
+            '### Step 1: run the diagnostic on your own PC',
+            'Download `serverRd-connect.ps1` from the job artifacts and run it in PowerShell.',
+            'It checks whether Tailscale is relaying you, tells you exactly what to change,',
+            'and then opens Remote Desktop for you.',
+            '',
+            '### Why it can still lag, and what actually helps',
+            '1. **Relayed Tailscale connection.** Tailscale relays whenever one side has a',
+            '   hard NAT and the other does not have a public IP (Easy NAT + Hard NAT =',
+            '   relayed). Azure gives the runner a hard NAT, so your side has to be easy.',
+            '   Fixes, in order of impact: turn on **IPv6** (IPv6 devices connect directly',
+            '   almost every time), enable **UPnP / NAT-PMP / PCP** on your router, allow',
+            '   outbound **UDP 41641**, and use a wired connection. If your ISP uses',
+            '   carrier-grade NAT, no local setting can fix it.',
+            '2. **Runner location.** Standard GitHub runners only run in US Azure regions',
+            '   (eastus, eastus2, westus2, centralus, southcentralus), which is roughly',
+            '   200 ms of round-trip time from Indonesia. No tunnel removes that. The real',
+            '   fix is a closer runner: set the repository variable `RDP_RUNNER` to a',
+            '   self-hosted runner, or to a larger runner placed in an Asia region using',
+            '   Azure private networking (Japan West is supported).',
+            '3. **No GPU.** The runner is a 4 vCPU VM that renders in software, so keep the',
+            '   session light: one window at a time, avoid 4K or full-screen video.',
+            '',
+            '### Already tuned for you',
+            '16-bit colour, 1366x768, persistent bitmap cache, no wallpaper / themes /',
+            'animations / font smoothing / desktop composition, all redirection disabled.',
+            ''
+          )
+          if ($env:CF_TUNNEL_TOKEN) {
+            $summaryLines += @(
+              '### Alternative transport: Cloudflare Tunnel',
+              'A **cloudflared** connector is running on this runner, so you can reach RDP',
+              'without Tailscale. Make sure the Cloudflare tunnel public hostname is type',
+              '**TCP** and points at `localhost:3389`. Then on your PC run:',
+              '',
+              '```',
+              'cloudflared access tcp --hostname rdp.example.com --url 127.0.0.1:33389',
+              '```',
+              '',
+              'and connect Remote Desktop to `127.0.0.1:33389`.',
+              ''
+            )
+          }
+          if ($tailscaleReady) {
+            $summaryLines += @(
+              'Save the block below as `serverRd.rdp`, then double-click it:',
+              '',
+              '```',
+              $rdp,
+              '```'
+            )
+          } else {
+            $summaryLines += @(
+              'Tailscale was not enabled for this run, so connect using the Cloudflare',
+              'Tunnel instructions above.',
+              ''
+            )
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($summaryLines -join "`r`n")
+
+      - name: Upload the client profile and diagnostic script
+        uses: actions/upload-artifact@v4
+        with:
+          name: serverRd-client-tools
+          path: |
+            serverRd-tuned.rdp
+            serverRd-connect.ps1
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Final RDP connectivity check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) { $tailscale = Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe" }
+
+          Write-Host "=== TAILSCALE IPv4 ==="
+          if (Test-Path $tailscale) { & $tailscale ip -4 }
+
+          Write-Host "=== RDP LISTENER ==="
+          Get-NetTCPConnection -LocalPort 3389 -State Listen | Select-Object LocalAddress,LocalPort,State,OwningProcess
+
+          Write-Host "=== FIREWALL RDP ==="
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+            Where-Object Enabled -eq "True" |
+            Select-Object DisplayName,Profile,Direction,Action | Format-Table -AutoSize
+
+          Write-Host "=== CPU/RAM ==="
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $os = Get-CimInstance Win32_OperatingSystem
+          [pscustomobject]@{
+            CPU        = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+            RAM_GB     = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+            FreeRAM_GB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+          } | Format-List
+
+      - name: Checkpoint Windows state for the next run
+        if: ${{ success() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $stateRoot = Join-Path $env:RUNNER_TEMP "serverRd-state"
+          $profileRoot = Join-Path $stateRoot "profile"
+          $registryRoot = Join-Path $stateRoot "registry"
+          Remove-Item $stateRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $profileRoot,$registryRoot | Out-Null
+
+          $sid = (Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue).SID.Value
+          $hiveLoaded = $false
+          if ($sid) {
+            & reg.exe query "HKU\$sid" 2>$null | Out-Null
+            $hiveLoaded = ($LASTEXITCODE -eq 0)
+          }
+          if ($hiveLoaded) {
+            & reg.exe save "HKU\$sid" "$stateRoot\NTUSER.DAT" /y | Out-Null
+            if (Test-Path "$stateRoot\NTUSER.DAT") { Write-Host "Captured loaded rdpuser hive with reg save." }
+          }
+          if (-not (Test-Path "$stateRoot\NTUSER.DAT") -and (Test-Path "C:\Users\rdpuser\NTUSER.DAT")) {
+            Copy-Item "C:\Users\rdpuser\NTUSER.DAT" "$stateRoot\NTUSER.DAT" -Force -ErrorAction SilentlyContinue
+            if (Test-Path "$stateRoot\NTUSER.DAT") { Write-Host "Captured NTUSER.DAT from profile." }
+          }
+
+          foreach ($dir in @("Desktop","Documents","Downloads","Pictures","Videos","Music","AppData\Roaming","AppData\Local")) {
+            $src = "C:\Users\rdpuser\$dir"; $dst = Join-Path $profileRoot $dir
+            if (Test-Path $src) {
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              robocopy $src $dst /E /XD "$src\Temp" "$src\Cache" "$src\Caches" "$src\Microsoft\Edge\User Data\Default\Cache" "$src\Microsoft\Edge\User Data\Default\Code Cache" "$src\Microsoft\Edge\User Data\Default\GPUCache" /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            }
+          }
+          $profileExists = Test-Path "C:\Users\rdpuser"
+          $profileFileCount = if ($profileExists) { @(Get-ChildItem "C:\Users\rdpuser" -Recurse -File -ErrorAction SilentlyContinue).Count } else { 0 }
+          if ($profileExists) {
+            Write-Host ("Checkpoint profile root exists. Files captured: {0}" -f $profileFileCount)
+            Get-ChildItem "C:\Users\rdpuser" -Force -ErrorAction SilentlyContinue | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+          } else {
+            Write-Warning "C:\Users\rdpuser does not exist at checkpoint time; no user profile files can be captured."
+          }
+          if (-not $profileExists -or $profileFileCount -eq 0) {
+            Write-Warning "The RDP user has no initialized profile yet. Log in once before the session ends if you want files/settings to persist."
+          }
+
+          $systemKeys = @(
+            "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server",
+            "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp",
+            "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services",
+            "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search",
+            "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR",
+            "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+          )
+          foreach ($key in $systemKeys) { $safe = ($key -replace '[\\:]','_'); & reg.exe export $key (Join-Path $registryRoot "$safe.reg") /y 2>$null | Out-Null }
+
+          if (Get-Command winget.exe -ErrorAction SilentlyContinue) { & winget.exe export --output "$stateRoot\winget.json" --include-versions --accept-source-agreements --disable-interactivity }
+          @("checkpoint_created_utc=$([DateTime]::UtcNow.ToString('o'))","runner_environment=$env:RUNNER_ENVIRONMENT","note=Portable profile, selected registry settings and WinGet-installable apps are checkpointed; RAM/live processes are not.") | Set-Content "$stateRoot\README.txt" -Encoding UTF8
+
+          $stateZip = Join-Path $env:RUNNER_TEMP "serverRd-state.zip"
+          Remove-Item $stateZip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stateRoot\*" -DestinationPath $stateZip -CompressionLevel Optimal
+          if (-not (Test-Path $stateZip)) { throw "Failed to create ServerRd state archive." }
+          Write-Host ("Checkpoint size: {0:N2} MB" -f ((Get-Item $stateZip).Length / 1MB))
+
+      - name: Upload Windows state checkpoint
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: serverRd-state
+          path: ${{ runner.temp }}/serverRd-state.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Keep RDP alive (5h20m window, under the 6h hosted cap)
+        shell: pwsh
+        run: |
+          Write-Host "ServerRd RDP is ready. Chained multi-day session - each run holds for ~5h20m."
+          Write-Host "RDP username: rdpuser"
+          Write-Host "Use the tuned .rdp profile from the step summary for the lowest latency."
+          # Lightweight heartbeat only. Heavy WMI/CIM polling every minute was
+          # adding measurable CPU/IO overhead to the box we are trying to keep fast.
+          # The listener is re-checked every 10 minutes instead of every minute.
+          # 320 minutes leaves headroom for the ~3-5 min of setup steps above so
+          # the job always finishes before GitHub's hard 360-minute kill.
+          for ($i = 1; $i -le 320; $i++) {
+            if ($i -eq 1 -or $i % 10 -eq 0) {
+              $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              $state = if ($service) { $service.Status } else { "Unknown" }
+              $listening = [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] minute $i/320 | TermService=$state | RDP listening=$listening"
+            }
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Chain the next run for the multi-day session
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          START_INPUT: ${{ inputs.start }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "${{ github.repository }}"
+          $ref  = "${{ github.ref_name }}"
+
+          # Session length in days, controlled by the RDP_DAYS repository variable.
+          $days = 7.0
+          if ("${{ vars.RDP_DAYS }}") { $days = [double]"${{ vars.RDP_DAYS }}" }
+          if ($days -le 0) {
+            Write-Host "RDP_DAYS=0 - stopping the chain. This was the last run."
+            exit 0
+          }
+
+          # The original start time survives across chained runs via the input.
+          # Read GitHub expressions through environment variables so an empty
+          # workflow_dispatch input never becomes Parse("") in PowerShell.
+          $start = [string]$env:START_INPUT
+          if ([string]::IsNullOrWhiteSpace($start)) {
+            $start = [string]$env:RUN_STARTED_AT
+          }
+          try {
+            $started = [datetimeoffset]::Parse(
+              $start,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::RoundtripKind
+            )
+          } catch {
+            throw "Invalid session start timestamp: '$start'"
+          }
+          $elapsed = [datetimeoffset]::UtcNow - $started
+          if ($elapsed.TotalHours -ge (24 * $days)) {
+            Write-Host ("Session goal reached: {0:N1}h of {1:N0}h. Chain stopped." -f $elapsed.TotalHours, (24 * $days))
+            exit 0
+          }
+
+          $headers = @{
+            Authorization            = "token $env:GITHUB_TOKEN"
+            Accept                   = "application/vnd.github+json"
+            "X-GitHub-Api-Version"  = "2022-11-28"
+          }
+          $body = @{ ref = $ref; inputs = @{ start = $started.ToString('o') } } | ConvertTo-Json -Compress
+          Invoke-RestMethod -Method Post `
+            -Uri "https://api.github.com/repos/$repo/actions/workflows/vm-test.yml/dispatches" `
+            -Headers $headers -Body $body -ContentType "application/json"
+          if ("${{ runner.environment }}" -eq "self-hosted") {
+            Write-Host ("Chained next run: SAME persistent runner; it can wait offline through reboot." -f $elapsed.TotalHours, (24 * $days))
+          } else {
+            Write-Host ("Chained next run: NEW GitHub-hosted VM." -f $elapsed.TotalHours, (24 * $days))
+          }
