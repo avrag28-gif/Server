@@ -1,0 +1,919 @@
+name: Windows RDP Smooth 7D
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start timestamp"
+        required: false
+        default: ""
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 430
+
+    env:
+      STATE_ARTIFACT: serverRd-state
+      RDP_USER: rdpuser
+
+    steps:
+
+      # ============================================================
+      # 1. BASIC INFORMATION
+      # ============================================================
+      - name: Show runner information
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Windows RDP Smooth 7D"
+          Write-Host "========================================="
+          Write-Host "Computer : $env:COMPUTERNAME"
+          Write-Host "User     : $env:USERNAME"
+          Write-Host "OS       : $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+
+      # ============================================================
+      # 2. CREATE RDP USER
+      # ============================================================
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          $user = $env:RDP_USER
+
+          try {
+              $existing = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+
+              if (-not $existing) {
+                  $password = [System.Web.Security.Membership]::GeneratePassword(24, 6)
+                  $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+                  New-LocalUser `
+                    -Name $user `
+                    -Password $secure `
+                    -PasswordNeverExpires:$true `
+                    -AccountNeverExpires:$true `
+                    -UserMayNotChangePassword:$true `
+                    -Description "Persistent GitHub RDP user"
+
+                  Write-Host "Created user: $user"
+                  Write-Host "RDP password:"
+                  Write-Host $password
+              }
+              else {
+                  Write-Host "User already exists: $user"
+              }
+
+              Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+
+              $profile = "C:\Users\$user"
+
+              if (-not (Test-Path $profile)) {
+                  New-Item -ItemType Directory -Path $profile -Force | Out-Null
+              }
+
+              icacls $profile /inheritance:e /grant "${user}:(OI)(CI)F" /T /C | Out-Null
+
+              Write-Host "RDP user ready."
+          }
+          catch {
+              Write-Warning "User setup warning: $($_.Exception.Message)"
+          }
+
+      # ============================================================
+      # 3. ENABLE RDP
+      # ============================================================
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          Set-Service -Name TermService -StartupType Automatic
+
+          Start-Service TermService -ErrorAction SilentlyContinue
+
+          Write-Host "RDP enabled."
+
+      # ============================================================
+      # 4. RESTORE PREVIOUS STATE
+      # ============================================================
+      - name: Restore previous Windows state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " RESTORING PREVIOUS WINDOWS STATE"
+          Write-Host "========================================="
+
+          $tempRoot = Join-Path $env:TEMP "serverRd-restore"
+          Remove-Item $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+
+          $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $artifacts = @()
+
+          try {
+              for ($page = 1; $page -le 10; $page++) {
+
+                  $url = "https://api.github.com/repos/$env:REPO/actions/artifacts?per_page=100&page=$page"
+
+                  try {
+                      $response = Invoke-RestMethod `
+                          -Uri $url `
+                          -Headers $headers `
+                          -Method Get `
+                          -ErrorAction Stop
+
+                      if ($response.artifacts) {
+                          $artifacts += @($response.artifacts)
+                      }
+
+                      if ($response.artifacts.Count -lt 100) {
+                          break
+                      }
+                  }
+                  catch {
+                      Write-Warning "Artifact page $page failed: $($_.Exception.Message)"
+                      break
+                  }
+              }
+          }
+          catch {
+              Write-Warning "Unable to query GitHub artifacts."
+          }
+
+          # --------------------------------------------------------
+          # SELECT NEWEST NON-EXPIRED ARTIFACT
+          # --------------------------------------------------------
+          $candidate = $artifacts |
+              Where-Object {
+                  $_.name -eq $env:STATE_ARTIFACT -and
+                  $_.id -and
+                  $_.expired -ne $true -and
+                  $_.workflow_run.id -ne [int64]$env:CURRENT_RUN_ID
+              } |
+              Sort-Object {
+                  [datetime]$_.created_at
+              } -Descending |
+              Select-Object -First 1
+
+          if (-not $candidate) {
+              Write-Warning "No previous usable checkpoint found."
+              Write-Host "Continuing without restore."
+              exit 0
+          }
+
+          Write-Host ""
+          Write-Host "Previous checkpoint:"
+          Write-Host "Artifact ID : $($candidate.id)"
+          Write-Host "Created     : $($candidate.created_at)"
+          Write-Host "Run ID      : $($candidate.workflow_run.id)"
+          Write-Host "Run status  : $($candidate.workflow_run.status)"
+          Write-Host "Run conclu. : $($candidate.workflow_run.conclusion)"
+
+          # --------------------------------------------------------
+          # DOWNLOAD
+          # --------------------------------------------------------
+          $zipPath = Join-Path $tempRoot "state.zip"
+
+          try {
+              $downloadUrl = "https://api.github.com/repos/$env:REPO/actions/artifacts/$($candidate.id)/zip"
+
+              Invoke-WebRequest `
+                  -Uri $downloadUrl `
+                  -Headers $headers `
+                  -OutFile $zipPath `
+                  -ErrorAction Stop
+
+              Write-Host "Artifact downloaded."
+          }
+          catch {
+              Write-Warning "Failed to download previous artifact."
+              Write-Warning $_.Exception.Message
+              exit 0
+          }
+
+          if (-not (Test-Path $zipPath)) {
+              Write-Warning "Downloaded artifact does not exist."
+              exit 0
+          }
+
+          # --------------------------------------------------------
+          # EXTRACT
+          # --------------------------------------------------------
+          $extractRoot = Join-Path $tempRoot "extracted"
+
+          try {
+              Expand-Archive `
+                  -Path $zipPath `
+                  -DestinationPath $extractRoot `
+                  -Force `
+                  -ErrorAction Stop
+
+              Write-Host "Artifact extracted."
+          }
+          catch {
+              Write-Warning "Artifact extraction failed."
+              Write-Warning $_.Exception.Message
+              exit 0
+          }
+
+          # Find state directory recursively.
+          $stateRoot = $extractRoot
+
+          $stateCandidates = @(
+              Get-ChildItem `
+                -Path $extractRoot `
+                -Directory `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+              Where-Object {
+                  (Test-Path (Join-Path $_.FullName "NTUSER.DAT")) -or
+                  (Test-Path (Join-Path $_.FullName "profile"))
+              }
+          )
+
+          if ($stateCandidates.Count -gt 0) {
+              $stateRoot = $stateCandidates[0].FullName
+          }
+
+          Write-Host "State root: $stateRoot"
+
+          # --------------------------------------------------------
+          # DETECT CONTENT
+          # --------------------------------------------------------
+          $ntuser = Join-Path $stateRoot "NTUSER.DAT"
+
+          $profileSource = Join-Path $stateRoot "profile"
+
+          $registrySource = Join-Path $stateRoot "registry"
+
+          $wingetSource = Join-Path $stateRoot "winget"
+
+          $hasNtUser = Test-Path $ntuser
+          $hasProfile = Test-Path $profileSource
+          $hasRegistry = Test-Path $registrySource
+          $hasWinget = Test-Path $wingetSource
+
+          if (-not ($hasNtUser -or $hasProfile -or $hasRegistry -or $hasWinget)) {
+              Write-Warning "Checkpoint exists but contains no recognizable state."
+              Write-Host "Skipping restore."
+              exit 0
+          }
+
+          $destination = "C:\Users\$env:RDP_USER"
+
+          # --------------------------------------------------------
+          # STOP RDP SERVICE BEFORE PROFILE RESTORE
+          # --------------------------------------------------------
+          try {
+              Stop-Service TermService -Force -ErrorAction SilentlyContinue
+          }
+          catch {
+              Write-Warning "Could not stop TermService."
+          }
+
+          Start-Sleep -Seconds 2
+
+          # ========================================================
+          # RESTORE NTUSER.DAT
+          # ========================================================
+          if ($hasNtUser) {
+              try {
+                  $destinationNtUser = Join-Path $destination "NTUSER.DAT"
+
+                  if (Test-Path $destinationNtUser) {
+                      Copy-Item `
+                        $destinationNtUser `
+                        "$destinationNtUser.pre-restore" `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+                  }
+
+                  Copy-Item `
+                    $ntuser `
+                    $destinationNtUser `
+                    -Force `
+                    -ErrorAction Stop
+
+                  Write-Host "NTUSER.DAT restored."
+              }
+              catch {
+                  Write-Warning "NTUSER.DAT restore failed: $($_.Exception.Message)"
+              }
+          }
+
+          # ========================================================
+          # RESTORE PROFILE DATA
+          # ========================================================
+          if ($hasProfile) {
+
+              $folders = @(
+                  "Desktop",
+                  "Documents",
+                  "Downloads",
+                  "Pictures",
+                  "Videos",
+                  "Music",
+                  "AppData\Roaming",
+                  "AppData\Local"
+              )
+
+              foreach ($folder in $folders) {
+
+                  $source = Join-Path $profileSource $folder
+                  $target = Join-Path $destination $folder
+
+                  if (-not (Test-Path $source)) {
+                      continue
+                  }
+
+                  try {
+                      if (-not (Test-Path $target)) {
+                          New-Item `
+                            -ItemType Directory `
+                            -Path $target `
+                            -Force | Out-Null
+                      }
+
+                      robocopy `
+                        $source `
+                        $target `
+                        /E `
+                        /COPY:DAT `
+                        /DCOPY:DAT `
+                        /R:2 `
+                        /W:2 `
+                        /XJ `
+                        /NFL `
+                        /NDL `
+                        /NP
+
+                      $rc = $LASTEXITCODE
+
+                      if ($rc -le 7) {
+                          Write-Host "Restored: $folder"
+                      }
+                      else {
+                          Write-Warning "Robocopy failed for $folder with exit code $rc"
+                      }
+                  }
+                  catch {
+                      Write-Warning "Failed restoring $folder : $($_.Exception.Message)"
+                  }
+              }
+          }
+
+          # ========================================================
+          # RESTORE REGISTRY
+          # ========================================================
+          if ($hasRegistry) {
+
+              $regFiles = Get-ChildItem `
+                  -Path $registrySource `
+                  -Filter "*.reg" `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue
+
+              foreach ($reg in $regFiles) {
+
+                  try {
+                      Write-Host "Importing registry: $($reg.FullName)"
+
+                      & reg.exe import "$($reg.FullName)" | Out-Host
+
+                      if ($LASTEXITCODE -eq 0) {
+                          Write-Host "Registry imported successfully."
+                      }
+                      else {
+                          Write-Warning "Registry import returned exit code $LASTEXITCODE"
+                      }
+                  }
+                  catch {
+                      Write-Warning "Registry import failed: $($_.Exception.Message)"
+                  }
+              }
+          }
+
+          # ========================================================
+          # RESTORE WINGET PACKAGES
+          # ========================================================
+          if ($hasWinget) {
+
+              $manifests = Get-ChildItem `
+                  -Path $wingetSource `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.Extension -in @(".json", ".yaml", ".yml")
+              }
+
+              foreach ($manifest in $manifests) {
+
+                  try {
+                      Write-Host "Importing WinGet manifest: $($manifest.FullName)"
+
+                      winget import `
+                        --import-file "$($manifest.FullName)" `
+                        --accept-source-agreements `
+                        --accept-package-agreements `
+                        --disable-interactivity
+
+                      if ($LASTEXITCODE -eq 0) {
+                          Write-Host "WinGet import completed."
+                      }
+                      else {
+                          Write-Warning "WinGet import returned exit code $LASTEXITCODE"
+                      }
+                  }
+                  catch {
+                      Write-Warning "WinGet import failed: $($_.Exception.Message)"
+                  }
+
+                  break
+              }
+          }
+
+          # ========================================================
+          # REPAIR PROFILE PERMISSIONS
+          # ========================================================
+          try {
+              icacls $destination /inheritance:e /T /C | Out-Null
+
+              icacls `
+                $destination `
+                /grant "${env:RDP_USER}:(OI)(CI)F" `
+                /T `
+                /C | Out-Null
+
+              Write-Host "Profile permissions repaired."
+          }
+          catch {
+              Write-Warning "Could not fully repair profile permissions."
+          }
+
+          # ========================================================
+          # RESTART RDP
+          # ========================================================
+          try {
+              Set-Service TermService -StartupType Automatic
+              Start-Service TermService -ErrorAction SilentlyContinue
+          }
+          catch {
+              Write-Warning "Could not restart TermService immediately."
+          }
+
+          Start-Sleep -Seconds 3
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " PREVIOUS STATE RESTORE FINISHED"
+          Write-Host "========================================="
+
+          exit 0
+
+      # ============================================================
+      # 5. INSTALL TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          try {
+              winget install `
+                --id Tailscale.Tailscale `
+                --exact `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+          }
+          catch {
+              Write-Warning "Tailscale installation failed."
+          }
+
+          $tailscale = Get-ChildItem `
+            "C:\Program Files\Tailscale\tailscale.exe" `
+            -ErrorAction SilentlyContinue
+
+          if ($tailscale) {
+
+              try {
+                  & $tailscale.FullName up `
+                    --authkey="$env:TAILSCALE_AUTHKEY" `
+                    --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+                  Write-Host "Tailscale connected."
+              }
+              catch {
+                  Write-Warning "Tailscale connection failed."
+              }
+          }
+          else {
+              Write-Warning "Tailscale executable not found."
+          }
+
+      # ============================================================
+      # 6. OPTIONAL CLOUDFLARE TUNNEL
+      # ============================================================
+      - name: Optional Cloudflare Tunnel
+        if: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN != '' }}
+        shell: pwsh
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          try {
+              winget install `
+                --id Cloudflare.cloudflared `
+                --exact `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+          }
+          catch {
+              Write-Warning "cloudflared installation failed."
+          }
+
+          $cf = Get-Command cloudflared -ErrorAction SilentlyContinue
+
+          if ($cf) {
+              try {
+                  Start-Process `
+                    -FilePath $cf.Source `
+                    -ArgumentList "tunnel --no-autoupdate run --token $env:CLOUDFLARE_TUNNEL_TOKEN" `
+                    -WindowStyle Hidden
+
+                  Write-Host "Cloudflare Tunnel started."
+              }
+              catch {
+                  Write-Warning "Cloudflare Tunnel failed."
+              }
+          }
+
+      # ============================================================
+      # 7. WINDOWS RDP OPTIMIZATION
+      # ============================================================
+      - name: Optimize Windows for RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          try {
+              Set-ItemProperty `
+                -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+                -Name "fDenyTSConnections" `
+                -Value 0
+
+              Set-ItemProperty `
+                -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+                -Name "UserAuthentication" `
+                -Value 0
+
+              Set-ItemProperty `
+                -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+                -Name "MinEncryptionLevel" `
+                -Value 1
+
+              Set-ItemProperty `
+                -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+                -Name "VisualFXSetting" `
+                -Value 2
+
+              Write-Host "RDP optimization applied."
+          }
+          catch {
+              Write-Warning "Some optimization settings failed."
+          }
+
+      # ============================================================
+      # 8. CHECKPOINT WINDOWS STATE
+      # ============================================================
+      - name: Checkpoint Windows state for next run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $root = Join-Path $env:RUNNER_TEMP "serverRd-state"
+          $profile = Join-Path $root "profile"
+          $registry = Join-Path $root "registry"
+          $winget = Join-Path $root "winget"
+
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          New-Item -ItemType Directory -Path $profile -Force | Out-Null
+          New-Item -ItemType Directory -Path $registry -Force | Out-Null
+          New-Item -ItemType Directory -Path $winget -Force | Out-Null
+
+          $userProfile = "C:\Users\$env:RDP_USER"
+
+          # --------------------------------------------------------
+          # COPY NTUSER.DAT
+          # --------------------------------------------------------
+          $ntuser = Join-Path $userProfile "NTUSER.DAT"
+
+          if (Test-Path $ntuser) {
+              try {
+                  Copy-Item `
+                    $ntuser `
+                    (Join-Path $root "NTUSER.DAT") `
+                    -Force
+
+                  Write-Host "NTUSER.DAT checkpoint created."
+              }
+              catch {
+                  Write-Warning "NTUSER.DAT checkpoint failed."
+              }
+          }
+
+          # --------------------------------------------------------
+          # COPY USER PROFILE
+          # --------------------------------------------------------
+          $folders = @(
+              "Desktop",
+              "Documents",
+              "Downloads",
+              "Pictures",
+              "Videos",
+              "Music",
+              "AppData\Roaming",
+              "AppData\Local"
+          )
+
+          foreach ($folder in $folders) {
+
+              $source = Join-Path $userProfile $folder
+              $target = Join-Path $profile $folder
+
+              if (-not (Test-Path $source)) {
+                  continue
+              }
+
+              try {
+                  New-Item `
+                    -ItemType Directory `
+                    -Path $target `
+                    -Force | Out-Null
+
+                  robocopy `
+                    $source `
+                    $target `
+                    /E `
+                    /COPY:DAT `
+                    /DCOPY:DAT `
+                    /R:2 `
+                    /W:2 `
+                    /XJ `
+                    /NFL `
+                    /NDL `
+                    /NP
+
+                  Write-Host "Checkpointed: $folder"
+              }
+              catch {
+                  Write-Warning "Failed checkpointing $folder"
+              }
+          }
+
+          # --------------------------------------------------------
+          # EXPORT USEFUL MACHINE REGISTRY
+          # --------------------------------------------------------
+          $registryExports = @{
+              "Environment" = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+              "Uninstall"   = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          }
+
+          foreach ($entry in $registryExports.GetEnumerator()) {
+
+              $output = Join-Path $registry "$($entry.Key).reg"
+
+              try {
+                  & reg.exe export `
+                    "$($entry.Value)" `
+                    "$output" `
+                    /y | Out-Null
+
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "Exported registry: $($entry.Key)"
+                  }
+              }
+              catch {
+                  Write-Warning "Registry export failed: $($entry.Key)"
+              }
+          }
+
+          # --------------------------------------------------------
+          # WINGET EXPORT
+          # --------------------------------------------------------
+          try {
+              winget export `
+                --output "$winget\packages.json" `
+                --include-versions `
+                --accept-source-agreements `
+                --disable-interactivity
+
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "WinGet package manifest created."
+              }
+              else {
+                  Write-Warning "WinGet export returned $LASTEXITCODE"
+              }
+          }
+          catch {
+              Write-Warning "WinGet export failed."
+          }
+
+          # --------------------------------------------------------
+          # CREATE CHECKPOINT MANIFEST
+          # --------------------------------------------------------
+          $manifest = [ordered]@{
+              CreatedAt      = (Get-Date).ToUniversalTime().ToString("o")
+              Computer       = $env:COMPUTERNAME
+              WorkflowRun    = $env:GITHUB_RUN_ID
+              Workflow       = $env:GITHUB_WORKFLOW
+              User           = $env:RDP_USER
+              HasNTUSER      = Test-Path (Join-Path $root "NTUSER.DAT")
+              HasProfile     = Test-Path $profile
+              HasRegistry    = Test-Path $registry
+              HasWinget      = Test-Path $winget
+          }
+
+          $manifest |
+            ConvertTo-Json -Depth 5 |
+            Set-Content `
+              (Join-Path $root "manifest.json") `
+              -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " CHECKPOINT CREATED"
+          Write-Host "========================================="
+
+      # ============================================================
+      # 9. UPLOAD CHECKPOINT
+      # ============================================================
+      - name: Upload Windows state checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: serverRd-state
+          path: ${{ runner.temp }}/serverRd-state
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      # ============================================================
+      # 10. CREATE RDP CLIENT FILE
+      # ============================================================
+      - name: Create RDP client configuration
+        shell: pwsh
+        run: |
+          $path = "$env:RUNNER_TEMP\rdpuser.rdp"
+
+          @"
+          screen mode id:i:2
+          use multimon:i:0
+          desktopwidth:i:1920
+          desktopheight:i:1080
+          session bpp:i:32
+          compression:i:1
+          keyboardhook:i:2
+          audiomode:i:0
+          redirectclipboard:i:1
+          redirectprinters:i:0
+          redirectcomports:i:0
+          redirectsmartcards:i:0
+          drivestoredirect:s:
+          full address:s:$env:COMPUTERNAME
+          username:s:$env:RDP_USER
+          prompt for credentials:i:1
+          administrative session:i:1
+          "@ | Set-Content $path -Encoding ASCII
+
+          Write-Host "RDP client file created: $path"
+
+      # ============================================================
+      # 11. KEEP RDP ALIVE
+      # ============================================================
+      - name: Keep RDP alive
+        shell: pwsh
+        run: |
+          $minutes = 315
+          $end = (Get-Date).AddMinutes($minutes)
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " RDP KEEPALIVE"
+          Write-Host "========================================="
+          Write-Host "Until: $end"
+
+          while ((Get-Date) -lt $end) {
+
+              $remaining = $end - (Get-Date)
+
+              Write-Host ""
+              Write-Host "RDP alive."
+              Write-Host "Remaining: $($remaining.ToString('hh\:mm\:ss'))"
+
+              try {
+                  Get-Service TermService |
+                    Select-Object Status, Name |
+                    Format-Table -AutoSize
+              }
+              catch {}
+
+              Start-Sleep -Seconds 60
+          }
+
+      # ============================================================
+      # 12. START NEXT RUN
+      # ============================================================
+      - name: Start next RDP workflow
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " STARTING NEXT WORKFLOW"
+          Write-Host "========================================="
+
+          try {
+
+              $headers = @{
+                  Authorization = "Bearer $env:GH_TOKEN"
+                  Accept        = "application/vnd.github+json"
+                  "X-GitHub-Api-Version" = "2022-11-28"
+              }
+
+              # Get the actual workflow filename.
+              $workflowFile = "${{ github.workflow_ref }}"
+
+              $workflowFile = $workflowFile -replace '^.*/\.github/workflows/', ''
+              $workflowFile = $workflowFile -replace '@.*$', ''
+
+              Write-Host "Detected workflow: $workflowFile"
+
+              $ref = "${{ github.ref_name }}"
+
+              $body = @{
+                  ref = $ref
+                  inputs = @{
+                      start = (Get-Date).ToUniversalTime().ToString("o")
+                  }
+              } | ConvertTo-Json -Compress
+
+              $dispatchUrl = "https://api.github.com/repos/$env:REPO/actions/workflows/$workflowFile/dispatches"
+
+              Invoke-RestMethod `
+                -Method Post `
+                -Uri $dispatchUrl `
+                -Headers $headers `
+                -Body $body `
+                -ContentType "application/json"
+
+              Write-Host "Next workflow dispatched successfully."
+          }
+          catch {
+              Write-Warning "Could not start next workflow."
+              Write-Warning $_.Exception.Message
+          }
